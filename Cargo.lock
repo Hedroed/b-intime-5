@@ -21,6 +21,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
+name = "b-intime-5"
+version = "0.1.0"
+dependencies = [
+ "critical-section",
+ "embedded-io",
+ "esp-alloc",
+ "esp-backtrace",
+ "esp-bootloader-esp-idf",
+ "esp-hal",
+ "esp-println",
+ "esp-wifi",
+ "heapless 0.9.1",
+ "smoltcp",
+ "static_cell",
+]
+
+[[package]]
 name = "basic-toml"
 version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1297,23 +1314,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "21a0236b59786fed61e2a80582dd500fe61f18b5dca67a4a067d0bc9039339cf"
 dependencies = [
  "memchr",
-]
-
-[[package]]
-name = "xiao-testo"
-version = "0.1.0"
-dependencies = [
- "critical-section",
- "embedded-io",
- "esp-alloc",
- "esp-backtrace",
- "esp-bootloader-esp-idf",
- "esp-hal",
- "esp-println",
- "esp-wifi",
- "heapless 0.9.1",
- "smoltcp",
- "static_cell",
 ]
 
 [[package]]

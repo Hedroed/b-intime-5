@@ -1,11 +1,11 @@
 [package]
 edition      = "2021"
-name         = "xiao-testo"
+name         = "b-intime-5"
 rust-version = "1.86"
 version      = "0.1.0"
 
 [[bin]]
-name = "xiao-testo"
+name = "b-intime-5"
 path = "./src/bin/main.rs"
 
 [dependencies]
