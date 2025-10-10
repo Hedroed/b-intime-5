@@ -3,37 +3,26 @@
 
 use esp_hal::rng::Rng;
 // --- Standard ESP-HAL and System Crates ---
-use esp_hal::timer::timg::TimerGroup;
-use esp_hal::{
-    clock::CpuClock, esp_riscv_rt::entry
-};
 use esp_backtrace as _;
+use esp_hal::timer::timg::TimerGroup;
+use esp_hal::{clock::CpuClock, esp_riscv_rt::entry};
 use esp_println::println;
-use esp_wifi::wifi::{
-    AccessPointConfiguration, Configuration,
-};
-use esp_wifi::{
-    init,
-    wifi::{
-        AccessPointConfiguration,
-        Configuration,
-        event::{self, EventExt},
-    },
-};
+use esp_wifi::wifi::{AccessPointConfiguration, Configuration};
+use esp_wifi::init;
+use smoltcp::iface::SocketSet;
+use smoltcp::socket::udp;
 
 // --- Networking Crates ---
+use core::fmt::Write;
+use heapless::string::String;
 use smoltcp::{
-    wire::{
-        IpAddress, IpCidr, DhcpServer
-    },
     socket::{
-        udp::{Socket as UdpSocket},
         tcp::{Socket as TcpSocket, State},
+        udp::Socket as UdpSocket,
     },
     time::Instant,
+    wire::{IpAddress, IpCidr},
 };
-use heapless::string::String;
-use core::fmt::Write;
 
 // --- Network Configuration Constants ---
 const SSID: &str = "ESP32C6-AP";
@@ -58,6 +47,15 @@ const TCP_RX_BUF_SIZE: usize = 1536;
 const TCP_TX_BUF_SIZE: usize = 1536;
 const UDP_BUF_SIZE: usize = 512;
 const SOCKET_COUNT: usize = 8; // Max number of sockets in the set
+
+macro_rules! make_static {
+    ($t:ty,$val:expr) => {{
+        static STATIC_CELL: static_cell::StaticCell<$t> = static_cell::StaticCell::new();
+        #[deny(unused_attributes)]
+        let x = STATIC_CELL.uninit().write(($val));
+        x
+    }};
+}
 
 #[entry]
 fn main() -> ! {
@@ -91,9 +89,6 @@ fn main() -> ! {
     let mut device = interfaces.ap;
     let mut iface = create_interface(&mut device);
 
-    // Use a static cell to hold the Wi-Fi device instance
-    let mut wifi_device = make_static!(WifiDevice::new(wifi, peripherals.RADIO_CLK, Rng::new(peripherals.RNG)));
-
     // Configure and start Wi-Fi in Access Point mode
     let ap_config = Configuration::AccessPoint(AccessPointConfiguration {
         ssid: SSID.into(),
@@ -123,17 +118,19 @@ fn main() -> ! {
 
     // 4. smoltcp Socket Storage
     let mut socket_storage = [None; SOCKET_COUNT];
-    let socket_set = make_static!(SocketSet::new(&mut socket_storage[..]));
+    let socket_set = make_static!(SocketSet<'static>, SocketSet::new(&mut socket_storage[..]));
 
     // --- 5. DHCP Server Setup ---
     // Allocate static memory for the UDP socket buffers
-    let dhcp_socket_rx_buffer = make_static!([UdpPacketBuffer::new([UdpPacketBuffer::new_args(); 1], [0; UDP_BUF_SIZE])]);
-    let dhcp_socket_tx_buffer = make_static!([UdpPacketBuffer::new([UdpPacketBuffer::new_args(); 1], [0; UDP_BUF_SIZE])]);
-
-    let mut dhcp_socket = UdpSocket::new(
-        dhcp_socket_rx_buffer,
-        dhcp_socket_tx_buffer
+    let udp_rx_buffer = udp::PacketBuffer::new(
+        vec![udp::PacketMetadata::EMPTY, udp::PacketMetadata::EMPTY],
+        vec![0; 65535],
     );
+    let udp_tx_buffer = udp::PacketBuffer::new(
+        vec![udp::PacketMetadata::EMPTY, udp::PacketMetadata::EMPTY],
+        vec![0; 65535],
+    );
+    let dhcp_socket = udp::Socket::new(udp_rx_buffer, udp_tx_buffer);
 
     // Bind the socket to the DHCP server port (67)
     dhcp_socket.bind(67).unwrap();
@@ -148,9 +145,13 @@ fn main() -> ! {
         &[DHCP_POOL_START.into(), DHCP_POOL_END.into()],
         DHCP_LEASE_TIME,
         DHCP_MAX_LEASES,
-    ).unwrap();
+    )
+    .unwrap();
 
-    println!("DHCP Pool configured: {:?} to {:?}", DHCP_POOL_START, DHCP_POOL_END);
+    println!(
+        "DHCP Pool configured: {:?} to {:?}",
+        DHCP_POOL_START, DHCP_POOL_END
+    );
 
     // --- 6. HTTP Server Setup ---
     // Allocate static memory for the TCP socket buffers
@@ -158,7 +159,7 @@ fn main() -> ! {
     let tcp_tx_buffer = [0; TCP_TX_BUF_SIZE];
     let tcp_socket = TcpSocket::new(
         smoltcp::socket::tcp::SocketBuffer::new(&mut tcp_rx_buffer[..]),
-        smoltcp::socket::tcp::SocketBuffer::new(&mut tcp_tx_buffer[..])
+        smoltcp::socket::tcp::SocketBuffer::new(&mut tcp_tx_buffer[..]),
     );
     let http_handle = socket_set.add(tcp_socket);
 
@@ -170,7 +171,6 @@ fn main() -> ! {
         println!("HTTP server listening on port {}", HTTP_PORT);
     }
 
-
     // 7. Main Loop
     let mut current_time = Instant::from_millis(0);
     loop {
@@ -179,14 +179,14 @@ fn main() -> ! {
         current_time = Instant::from_millis(new_millis as i64);
 
         // Process network traffic (smoltcp poll)
-        let _ = iface.poll(current_time, wifi_device, socket_set);
+        let _ = iface.poll(current_time, &mut device, socket_set);
 
         // --- DHCP Server Service ---
         // Get the DHCP socket and poll the DHCP server logic
-        if let Some(mut socket) = socket_set.get_by_handle::<UdpSocket>(dhcp_handle) {
-            // dhcp_server.poll_udp_socket will check for and handle incoming DHCP requests (from port 67)
-            let _ = dhcp_server.poll_udp_socket(current_time, &mut socket);
-        }
+        let mut socket = socket_set.get_mut::<UdpSocket>(dhcp_handle);
+
+        // dhcp_server.poll_udp_socket will check for and handle incoming DHCP requests (from port 67)
+        let _ = dhcp_server.poll_udp_socket(current_time, &mut socket);
 
         // --- HTTP Server Service (TCP state machine) ---
         let http_socket = socket_set.get::<TcpSocket>(http_handle);
@@ -198,11 +198,11 @@ fn main() -> ! {
                     let mut buffer = [0u8; 512];
                     match http_socket.recv_slice(&mut buffer) {
                         Ok(len) => {
-                            let request_str = core::str::from_utf8(&buffer[..len]).unwrap_or("Invalid UTF8 Request");
+                            let request_str = core::str::from_utf8(&buffer[..len])
+                                .unwrap_or("Invalid UTF8 Request");
 
                             // Check for basic GET request (we only serve "/")
                             if request_str.starts_with("GET / ") {
-
                                 // Simple HTML Response Body
                                 let mut response_body: String<256> = String::new();
                                 write!(response_body, "
@@ -233,7 +233,12 @@ fn main() -> ! {
                                 let mut response_headers: String<256> = String::new();
                                 write!(response_headers, "HTTP/1.1 200 OK\r\n").unwrap();
                                 write!(response_headers, "Content-Type: text/html\r\n").unwrap();
-                                write!(response_headers, "Content-Length: {}\r\n", response_body.len()).unwrap();
+                                write!(
+                                    response_headers,
+                                    "Content-Length: {}\r\n",
+                                    response_body.len()
+                                )
+                                .unwrap();
                                 write!(response_headers, "Connection: close\r\n").unwrap();
                                 write!(response_headers, "\r\n").unwrap(); // End of headers
 
@@ -244,7 +249,6 @@ fn main() -> ! {
                                     // Shut down the write side and transition to CLOSE_WAIT
                                     http_socket.close();
                                 }
-
                             } else {
                                 // 404 response for unhandled paths
                                 let response = b"HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
@@ -261,7 +265,11 @@ fn main() -> ! {
             }
 
             // State 2: Connection is closing or waiting for remote to close
-            State::CloseWait | State::LastAck | State::FinWait1 | State::FinWait2 | State::Closing => {
+            State::CloseWait
+            | State::LastAck
+            | State::FinWait1
+            | State::FinWait2
+            | State::Closing => {
                 // Ensure the socket is properly closed to free the resource
                 http_socket.close();
             }
@@ -272,7 +280,6 @@ fn main() -> ! {
             // Other states are transient or handled by poll (like SYN_SENT, SYN_RCVD)
             _ => {}
         }
-
 
         // Allow the Wi-Fi driver to handle internal events like beaconing and association.
         // let _ = esp_wifi::tasks::service_tasks();
