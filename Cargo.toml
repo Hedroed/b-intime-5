@@ -11,6 +11,10 @@ path = "./src/bin/main.rs"
 [dependencies]
 esp-bootloader-esp-idf = { version = "0.2.0", features = ["esp32c6"] }
 esp-hal                = { version = "=1.0.0-rc.0", features = ["esp32c6", "unstable"] }
+esp-backtrace = { version = "0.17", features = ["esp32c6", "exception-handler", "panic-handler", "println"] }
+
+static_cell = "2.0.0" # Used for static buffer allocation in a no_std environment
+heapless = "0.9.1" # Used for small string/vec allocation
 
 critical-section = "1.2.0"
 embedded-io = "0.6.1"
@@ -24,13 +28,10 @@ esp-wifi = { version = "0.15.0", features = [
 ] }
 smoltcp = { version = "0.12.0", default-features = false, features = [
   "medium-ethernet",
-  "multicast",
   "proto-dhcpv4",
   "proto-dns",
   "proto-ipv4",
   "socket-dns",
-  "socket-icmp",
-  "socket-raw",
   "socket-tcp",
   "socket-udp",
 ] }
