@@ -11,22 +11,26 @@ use embassy_net::{
 };
 use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
-use esp_hal::{clock::CpuClock, config::{self, WatchdogConfig}, rtc_cntl::{Rtc, RwdtStage}, timer::timg::TimerGroup};
+use esp_hal::{
+    clock::CpuClock,
+    gpio::{Level, Output, OutputConfig},
+    rtc_cntl::Rtc,
+    timer::timg::TimerGroup,
+};
 use esp_println::println;
 use log::{error, info};
+use max7219::{connectors::Connector, DecodeMode};
 use sntpc::{get_time, NtpContext, NtpTimestampGenerator};
 
-/*
-// TODO: maybe i should make another crate for this make_static?
-/// This is macro from static_cell (static_cell::make_static!) but without weird stuff
-macro_rules! make_static {
-    ($val:expr) => {{
-        type T = impl ::core::marker::Sized;
-        static STATIC_CELL: static_cell::StaticCell<T> = static_cell::StaticCell::new();
-        STATIC_CELL.uninit().write($val)
-    }};
-}
-*/
+// When you are okay with using a nightly compiler it's better to use https://docs.rs/static_cell/2.1.0/static_cell/macro.make_static.html
+// macro_rules! mk_static {
+//     ($t:ty,$val:expr) => {{
+//         static STATIC_CELL: static_cell::StaticCell<$t> = static_cell::StaticCell::new();
+//         #[deny(unused_attributes)]
+//         let x = STATIC_CELL.uninit().write(($val));
+//         x
+//     }};
+// }
 
 const TIMEZONE: jiff::tz::TimeZone = jiff::tz::get!("UTC");
 const NTP_SERVER: &str = "pool.ntp.org";
@@ -60,9 +64,8 @@ esp_bootloader_esp_idf::esp_app_desc!();
 async fn main(spawner: Spawner) {
     esp_alloc::heap_allocator!(size: 150 * 1024);
 
-    let config = esp_hal::Config::default()
-        .with_cpu_clock(CpuClock::max());
-        // .with_watchdog(WatchdogConfig::default());
+    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
+    // .with_watchdog(WatchdogConfig::default());
 
     let peripherals = esp_hal::init(config);
 
@@ -102,7 +105,16 @@ async fn main(spawner: Spawner) {
 
     log::info!("wifi_res: {wifi_res:?}");
 
-    main_loop(wifi_res.sta_stack, rtc).await
+    let config = OutputConfig::default();
+    let cs = Output::new(peripherals.GPIO5, Level::High, config);
+    let mosi = Output::new(peripherals.GPIO4, Level::High, config);
+    let sclk = Output::new(peripherals.GPIO0, Level::High, config);
+
+    let display: max7219::MAX7219<
+        max7219::connectors::PinConnector<Output<'_>, Output<'_>, Output<'_>>,
+    > = max7219::MAX7219::from_pins(1, mosi, cs, sclk).unwrap();
+
+    main_loop(wifi_res.sta_stack, rtc, display).await
 
     // loop {
     //     // rtc.rwdt.feed();
@@ -111,7 +123,10 @@ async fn main(spawner: Spawner) {
     // }
 }
 
-async fn main_loop(stack: Stack<'_>, rtc: Rtc<'_>) {
+async fn main_loop<T>(stack: Stack<'static>, rtc: Rtc<'_>, mut display: max7219::MAX7219<T>)
+where
+    T: Connector,
+{
     let mut rx_meta = [PacketMetadata::EMPTY; 16];
     let mut rx_buffer = [0; 4096];
     let mut tx_meta = [PacketMetadata::EMPTY; 16];
@@ -152,6 +167,11 @@ async fn main_loop(stack: Stack<'_>, rtc: Rtc<'_>) {
     // Display initial Rtc time before synchronization
     let now = jiff::Timestamp::from_microsecond(rtc.current_time_us() as i64).unwrap();
     info!("Rtc: {now}");
+
+    display.power_on().unwrap();
+    display.set_decode_mode(0, DecodeMode::NoDecode).unwrap();
+    display.clear_display(0).unwrap();
+    display.set_intensity(0, 0x1).unwrap();
 
     loop {
         let addr: IpAddr = ntp_addrs[0].into();
