@@ -1,25 +1,37 @@
 #![no_std]
 #![no_main]
 
-use core::net::{IpAddr, SocketAddr};
+use b_intime_5::display::{Canvas, Screen};
+use reqwless::{client::HttpClient, request::RequestBuilder};
+use serde::Deserialize;
+
+use core::{
+    net::{IpAddr, SocketAddr},
+    str::from_utf8_unchecked,
+};
 
 use embassy_executor::Spawner;
 use embassy_net::{
-    dns::DnsQueryType,
+    dns::{DnsQueryType, DnsSocket},
+    tcp::client::{TcpClient, TcpClientState},
     udp::{PacketMetadata, UdpSocket},
     Stack,
 };
 use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
 use esp_hal::{
+    analog::adc::{Adc, AdcConfig, Attenuation},
     clock::CpuClock,
     gpio::{Level, Output, OutputConfig},
+    peripherals,
     rtc_cntl::Rtc,
+    spi::{self, master::Spi},
+    time::Rate,
     timer::timg::TimerGroup,
+    Blocking,
 };
 use esp_println::println;
 use log::{error, info};
-use max7219::{connectors::Connector, DecodeMode};
 use sntpc::{get_time, NtpContext, NtpTimestampGenerator};
 
 // When you are okay with using a nightly compiler it's better to use https://docs.rs/static_cell/2.1.0/static_cell/macro.make_static.html
@@ -32,7 +44,7 @@ use sntpc::{get_time, NtpContext, NtpTimestampGenerator};
 //     }};
 // }
 
-const TIMEZONE: jiff::tz::TimeZone = jiff::tz::get!("UTC");
+const TIMEZONE: jiff::tz::TimeZone = jiff::tz::get!("Europe/Paris");
 const NTP_SERVER: &str = "pool.ntp.org";
 
 /// Microseconds in a second
@@ -106,27 +118,88 @@ async fn main(spawner: Spawner) {
     log::info!("wifi_res: {wifi_res:?}");
 
     let config = OutputConfig::default();
-    let cs = Output::new(peripherals.GPIO5, Level::High, config);
-    let mosi = Output::new(peripherals.GPIO4, Level::High, config);
-    let sclk = Output::new(peripherals.GPIO0, Level::High, config);
+    let cs = Output::new(peripherals.GPIO17, Level::High, config);
+    let mosi = Output::new(peripherals.GPIO18, Level::High, config);
+    let sclk = Output::new(peripherals.GPIO19, Level::High, config);
 
-    let display: max7219::MAX7219<
-        max7219::connectors::PinConnector<Output<'_>, Output<'_>, Output<'_>>,
-    > = max7219::MAX7219::from_pins(1, mosi, cs, sclk).unwrap();
+    let mut spi = spi::master::Spi::new(
+        peripherals.SPI2,
+        spi::master::Config::default().with_frequency(Rate::from_khz(100)),
+    )
+    .unwrap()
+    .with_sck(sclk)
+    .with_mosi(mosi)
+    .with_cs(cs);
 
-    main_loop(wifi_res.sta_stack, rtc, display).await
+    spawner
+        .spawn(lum_loop(peripherals.GPIO2, peripherals.ADC1))
+        .expect("lum loop");
 
-    // loop {
-    //     // rtc.rwdt.feed();
-    //     log::info!("bump {}", esp_hal::time::Instant::now());
-    //     Timer::after_millis(15000).await;
-    // }
+    main_loop(wifi_res.sta_stack, rtc, &mut spi).await
 }
 
-async fn main_loop<T>(stack: Stack<'static>, rtc: Rtc<'_>, mut display: max7219::MAX7219<T>)
-where
-    T: Connector,
-{
+#[embassy_executor::task]
+async fn lum_loop(
+    analog_pin: peripherals::GPIO2<'static>,
+    adc1: peripherals::ADC1<'static>,
+) {
+    let mut adc1_config = AdcConfig::new();
+    let mut pin = adc1_config.enable_pin(analog_pin, Attenuation::_11dB);
+    let mut adc1 = Adc::new(adc1, adc1_config).into_async();
+
+    loop {
+        let pin_value: u16 = adc1.read_oneshot(&mut pin).await;
+        info!("lum {}", pin_value);
+
+        Timer::after(Duration::from_secs(1)).await;
+    }
+}
+
+use core::fmt::{self, Write};
+
+struct Wrapper<'a> {
+    buf: &'a mut [u8],
+    pub offset: usize,
+}
+
+impl<'a> Wrapper<'a> {
+    fn new(buf: &'a mut [u8]) -> Self {
+        Wrapper {
+            buf: buf,
+            offset: 0,
+        }
+    }
+}
+
+impl<'a> fmt::Write for Wrapper<'a> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let bytes = s.as_bytes();
+
+        // Skip over already-copied data
+        let remainder = &mut self.buf[self.offset..];
+        // Check if there is space remaining (return error instead of panicking)
+        if remainder.len() < bytes.len() {
+            return Err(core::fmt::Error);
+        }
+        // Make the two slices the same length
+        let remainder = &mut remainder[..bytes.len()];
+        // Copy
+        remainder.copy_from_slice(bytes);
+
+        // Update offset to avoid overwriting
+        self.offset += bytes.len();
+
+        Ok(())
+    }
+}
+
+async fn main_loop(stack: Stack<'static>, rtc: Rtc<'_>, spi: &mut Spi<'_, Blocking>) {
+    let mut buf = [0x20 as u8; 20];
+
+    let mut canvas = Canvas::<32, 16>::init();
+
+    Screen::<8>::init(spi);
+
     let mut rx_meta = [PacketMetadata::EMPTY; 16];
     let mut rx_buffer = [0; 4096];
     let mut tx_meta = [PacketMetadata::EMPTY; 16];
@@ -148,6 +221,13 @@ where
         Timer::after(Duration::from_millis(500)).await;
     }
 
+    let ha_res = access_website(stack.clone()).await;
+
+    write!(Wrapper::new(&mut buf), "{:.1}&", ha_res.temperature).expect("Can't write");
+    canvas.print_5x7(2, 9, unsafe { from_utf8_unchecked(&buf[0..5]) });
+    Screen::<8>::draw(spi, &canvas);
+    info!("DISPLAY1");
+
     let ntp_addrs = stack.dns_query(NTP_SERVER, DnsQueryType::A).await.unwrap();
 
     if ntp_addrs.is_empty() {
@@ -165,13 +245,10 @@ where
     socket.bind(123).unwrap();
 
     // Display initial Rtc time before synchronization
-    let now = jiff::Timestamp::from_microsecond(rtc.current_time_us() as i64).unwrap();
-    info!("Rtc: {now}");
-
-    display.power_on().unwrap();
-    display.set_decode_mode(0, DecodeMode::NoDecode).unwrap();
-    display.clear_display(0).unwrap();
-    display.set_intensity(0, 0x1).unwrap();
+    let now = jiff::Timestamp::from_microsecond(rtc.current_time_us() as i64)
+        .unwrap()
+        .to_zoned(TIMEZONE);
+    info!("Rtc: {}", now.strftime("%H%M"));
 
     loop {
         let addr: IpAddr = ntp_addrs[0].into();
@@ -187,30 +264,22 @@ where
 
         match result {
             Ok(time) => {
-                let old_time = rtc.current_time_us() as i64;
-
                 // Set time immediately after receiving to reduce time offset.
                 rtc.set_current_time_us(
                     (time.sec() as u64 * USEC_IN_SEC)
                         + ((time.sec_fraction() as u64 * USEC_IN_SEC) >> 32),
                 );
 
-                info!(
-                    "Response: {:?}\nnew: {}\nold : {}",
-                    time,
-                    // Create a Jiff Timestamp from seconds and nanoseconds
-                    jiff::Timestamp::from_second(time.sec() as i64)
-                        .unwrap()
-                        .checked_add(
-                            jiff::Span::new()
-                                .nanoseconds((time.seconds_fraction as i64 * 1_000_000_000) >> 32),
-                        )
-                        .unwrap()
-                        .to_zoned(TIMEZONE),
-                    jiff::Timestamp::from_microsecond(old_time)
-                        .unwrap()
-                        .to_zoned(TIMEZONE)
-                );
+                let time = jiff::Timestamp::from_microsecond(rtc.current_time_us() as i64)
+                    .unwrap()
+                    .to_zoned(TIMEZONE);
+
+                info!("Response: {:?}", time);
+
+                write!(Wrapper::new(&mut buf), "{}", time.strftime("%H:%M")).expect("Can't write");
+                canvas.print_8x8(0, 0, unsafe { from_utf8_unchecked(&buf[0..5]) });
+                Screen::<8>::draw(spi, &canvas);
+                info!("UPDATE");
             }
             Err(e) => {
                 error!("Error getting time: {e:?}");
@@ -219,4 +288,53 @@ where
 
         Timer::after(Duration::from_secs(60)).await;
     }
+}
+
+#[derive(Deserialize, Clone)]
+struct HAResponse<'a> {
+    state: &'a str,
+    attributes: HAAttributes,
+}
+
+#[derive(Deserialize, Clone)]
+struct HAAttributes {
+    temperature: f32,
+    humidity: usize,
+    wind_speed: f32,
+}
+
+async fn access_website(stack: Stack<'_>) -> HAAttributes {
+    let mut rx_buffer = [0; 4096];
+    let mut tx_buffer = [0; 4096];
+    let dns = DnsSocket::new(stack);
+    let tcp_state = TcpClientState::<1, 4096, 4096>::new();
+    let tcp = TcpClient::new(stack, &tcp_state);
+
+    let headers = [(
+        "Authorization",
+        concat!(
+            "Bearer ",
+            env!("HA_TOKEN", "no home assistant token provided")
+        ),
+    )];
+
+    let mut client = HttpClient::new(&tcp, &dns);
+    let mut buffer = [0u8; 4096];
+    let mut http_req = client
+        .request(
+            reqwless::request::Method::GET,
+            env!("HA_URI", "no home assistant uri provided"),
+        )
+        .await
+        .unwrap()
+        .headers(&headers);
+    let response = http_req.send(&mut buffer).await.unwrap();
+
+    info!("Got response");
+    let res = response.body().read_to_end().await.unwrap();
+
+    let (data, _remainder) = serde_json_core::from_slice::<HAResponse<'_>>(res).unwrap();
+
+    info!("Temp: {}", data.attributes.temperature);
+    return data.attributes;
 }

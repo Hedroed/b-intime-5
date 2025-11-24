@@ -25,12 +25,15 @@ static_cell = { version = "2.1.1", features = ["nightly"] }
 heapless = { version = "0.8.0", default-features = false }
 esp-alloc = "0.8.0"
 esp-bootloader-esp-idf = { version = "0.2.0", features = ["esp32c6", "log-04"] }
+
 jiff = { version = "0.2.10", default-features = false, features = ["static"] }
 sntpc = { version = "0.6.0", default-features = false, features = [
     "embassy-socket",
 ] }
-max7219 = "0.5.0"
 
+reqwless = { version = "0.13.0", default-features = false, features = [] }
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde-json-core = "0.6.0"
 
 [profile.dev]
 # Rust debug is too slow.
