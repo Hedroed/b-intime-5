@@ -21,7 +21,6 @@ use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
 use esp_hal::{
     analog::adc::{Adc, AdcConfig, Attenuation},
-    clock::CpuClock,
     gpio::{Level, Output, OutputConfig},
     peripherals,
     rtc_cntl::Rtc,
@@ -31,7 +30,6 @@ use esp_hal::{
     Blocking,
 };
 use esp_println::println;
-use log::{error, info};
 use sntpc::{get_time, NtpContext, NtpTimestampGenerator};
 
 // When you are okay with using a nightly compiler it's better to use https://docs.rs/static_cell/2.1.0/static_cell/macro.make_static.html
@@ -72,57 +70,56 @@ impl NtpTimestampGenerator for Timestamp<'_> {
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-#[esp_hal_embassy::main]
+#[esp_rtos::main]
 async fn main(spawner: Spawner) {
-    esp_alloc::heap_allocator!(size: 150 * 1024);
-
-    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
-    // .with_watchdog(WatchdogConfig::default());
-
-    let peripherals = esp_hal::init(config);
-
-    let rtc = Rtc::new(peripherals.LPWR);
-    // rtc.rwdt.set_timeout(RwdtStage::Stage0, esp_hal::time::Duration::from_millis(2000));
-    // rtc.rwdt.enable();
-    // log::info!("RWDT watchdog enabled!");
+    // esp_alloc::heap_allocator!(size: 150 * 1024);
 
     esp_println::logger::init_logger_from_env();
-    log::set_max_level(log::LevelFilter::Info);
 
-    let timg1 = TimerGroup::new(peripherals.TIMG1);
-    esp_hal_embassy::init(timg1.timer0);
+    let peripherals = esp_hal::init(esp_hal::Config::default());
 
-    let rng = esp_hal::rng::Rng::new(peripherals.RNG);
-    let nvs = esp_hal_wifimanager::Nvs::new(0x9000, 0x6000).unwrap();
+    esp_println::println!("Init!");
 
-    let wm_settings = esp_hal_wifimanager::WmSettings {
-        ssid: "B-intime-5".into(),
-        wifi_conn_timeout: 30000,
-        esp_reset_timeout: Some(300000), // 5min
-        ..Default::default()
-    };
+    let sw_int = esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+    let timg0 = TimerGroup::new(peripherals.TIMG0);
+    esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
 
-    let timg0 = esp_hal::timer::timg::TimerGroup::new(peripherals.TIMG0);
-    let wifi_res = esp_hal_wifimanager::init_wm(
-        wm_settings,
-        &spawner,
-        Some(&nvs),
-        rng.clone(),
-        timg0.timer0,
-        peripherals.WIFI,
-        None,
-    )
-    .await
-    .expect("wm init");
+    // let rtc = Rtc::new(peripherals.LPWR);
+    // rtc.rwdt.set_timeout(RwdtStage::Stage0, esp_hal::time::Duration::from_millis(2000));
+    // rtc.rwdt.enable();
+    esp_println::println!("RWDT watchdog enabled!");
 
-    log::info!("wifi_res: {wifi_res:?}");
+    // let rng = esp_hal::rng::Rng::new();
+    // let nvs = esp_hal_wifimanager::Nvs::new(0x9000, 0x6000).unwrap();
+
+    // let wm_settings = esp_hal_wifimanager::WmSettings {
+    //     ssid: "B-intime-5".into(),
+    //     wifi_conn_timeout: 30000,
+    //     esp_reset_timeout: Some(300000), // 5min
+    //     ..Default::default()
+    // };
+
+    // let timg0 = esp_hal::timer::timg::TimerGroup::new(peripherals.TIMG0);
+    // let wifi_res = esp_hal_wifimanager::init_wm(
+    //     wm_settings,
+    //     &spawner,
+    //     Some(&nvs),
+    //     rng.clone(),
+    //     timg0.timer0,
+    //     peripherals.WIFI,
+    //     None,
+    // )
+    // .await
+    // .expect("wm init");
+
+    // esp_println::println!("wifi_res: {wifi_res:?}");
 
     let config = OutputConfig::default();
     let cs = Output::new(peripherals.GPIO17, Level::High, config);
     let mosi = Output::new(peripherals.GPIO18, Level::High, config);
     let sclk = Output::new(peripherals.GPIO19, Level::High, config);
 
-    let mut spi = spi::master::Spi::new(
+    let mut _spi = spi::master::Spi::new(
         peripherals.SPI2,
         spi::master::Config::default().with_frequency(Rate::from_khz(100)),
     )
@@ -135,7 +132,7 @@ async fn main(spawner: Spawner) {
         .spawn(lum_loop(peripherals.GPIO2, peripherals.ADC1))
         .expect("lum loop");
 
-    main_loop(wifi_res.sta_stack, rtc, &mut spi).await
+    // main_loop(wifi_res.sta_stack, rtc, &mut spi).await
 }
 
 #[embassy_executor::task]

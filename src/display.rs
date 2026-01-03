@@ -1,5 +1,4 @@
 use esp_hal::{spi::master::Spi, Blocking};
-use log::info;
 
 use crate::font::{Font, ALPHABET_BIG_DIGITS, ALPHABET_NANO, ALPHABET_NORMAL, ALPHABET_TINY};
 
