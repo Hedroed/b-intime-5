@@ -3,7 +3,7 @@ use embassy_net::{Runner, Stack};
 use embassy_time::Duration;
 use esp_radio::wifi::WifiDevice;
 
-use crate::structs::WmInnerSignals;
+use crate::wifimanager::structs::WmInnerSignals;
 
 #[embassy_executor::task]
 pub async fn run_dhcp_server(ap_stack: Stack<'static>) {
@@ -27,7 +27,7 @@ pub async fn run_dhcp_server(ap_stack: Stack<'static>) {
     .await;
 
     if let Err(e) = res {
-        log::error!("run_dhcp_server failed! ({e:?})");
+        esp_println::println!("run_dhcp_server failed! ({e:?})");
     }
 }
 

@@ -1,4 +1,4 @@
-use crate::get_efuse_mac;
+use crate::wifimanager::utils::get_efuse_mac;
 use alloc::{rc::Rc, string::String};
 use embassy_executor::SpawnError;
 use embassy_net::Stack;
@@ -22,10 +22,10 @@ pub enum WmError {
     WmTimeout,
 
     WifiControllerStartError,
-    FlashError(tickv::ErrorCode),
     WifiError(WifiError),
     WifiInitalizationError(InitializationError),
-    SerdeError(serde_json::Error),
+    SerdeErrorDe(serde_json_core::de::Error),
+    SerdeErrorSer(serde_json_core::ser::Error),
     TaskSpawnError,
     NvsError,
 
@@ -50,15 +50,21 @@ impl From<SpawnError> for WmError {
     }
 }
 
-impl From<tickv::ErrorCode> for WmError {
-    fn from(value: tickv::ErrorCode) -> Self {
-        Self::FlashError(value)
+impl From<serde_json_core::de::Error> for WmError {
+    fn from(value: serde_json_core::de::Error) -> Self {
+        Self::SerdeErrorDe(value)
     }
 }
 
-impl From<serde_json::Error> for WmError {
-    fn from(value: serde_json::Error) -> Self {
-        Self::SerdeError(value)
+impl From<serde_json_core::ser::Error> for WmError {
+    fn from(value: serde_json_core::ser::Error) -> Self {
+        Self::SerdeErrorSer(value)
+    }
+}
+
+impl From<esp_bootloader_esp_idf::partitions::Error> for WmError {
+    fn from(_value: esp_bootloader_esp_idf::partitions::Error) -> Self {
+        Self::NvsError
     }
 }
 
@@ -79,10 +85,6 @@ pub struct WmSettings {
     /// SSID name
     pub ssid: String,
 
-    /// Panel hosted on AP (html)
-    /// TODO: Make this as dictionary so, you will be able to upload more files
-    pub wifi_panel: &'static str,
-
     /// Max time WiFi will try to connect (in ms)
     pub wifi_conn_timeout: u64,
 
@@ -100,10 +102,9 @@ pub struct WmSettings {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub(crate) struct AutoSetupSettings {
+pub struct AutoSetupSettings {
     pub ssid: String,
     pub psk: String,
-    pub data: Option<serde_json::Value>,
 }
 
 impl AutoSetupSettings {
@@ -125,7 +126,6 @@ impl Default for WmSettings {
     fn default() -> Self {
         Self {
             ssid: alloc::format!("ESP-{:X}", get_efuse_mac()),
-            wifi_panel: include_str!("./panel.html"),
 
             wifi_reconnect_time: 1000,
             wifi_conn_timeout: 15000,
@@ -140,7 +140,6 @@ impl Default for WmSettings {
 pub struct WmReturn {
     pub wifi_init: &'static Controller<'static>,
     pub sta_stack: Stack<'static>,
-    pub data: Option<serde_json::Value>,
     pub ip_address: [u8; 4],
 
     pub(crate) stop_signal: Rc<Signal<CriticalSectionRawMutex, bool>>,
@@ -163,7 +162,6 @@ impl ::core::fmt::Debug for WmReturn {
     #[inline]
     fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
         f.debug_struct("WmReturn")
-            .field("data", &self.data)
             .field("ip_address", &self.ip_address)
             .finish()
     }
@@ -173,7 +171,7 @@ pub struct WmInnerSignals {
     pub wifi_scan_res: Mutex<NoopRawMutex, alloc::string::String>,
 
     /// This is used to tell main task to connect to wifi
-    pub wifi_conn_info_sig: Signal<NoopRawMutex, alloc::vec::Vec<u8>>,
+    pub wifi_conn_info_sig: Signal<NoopRawMutex, AutoSetupSettings>,
 
     end_signal_pubsub: PubSubChannel<NoopRawMutex, (), 1, 16, 1>,
 }

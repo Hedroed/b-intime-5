@@ -1,7 +1,5 @@
-#![no_std]
-
-extern crate alloc;
 use alloc::rc::Rc;
+use esp_radio::Controller;
 use core::ops::DerefMut;
 use embassy_executor::Spawner;
 use embassy_net::{Config, Runner, StackResources};
@@ -11,13 +9,14 @@ use embassy_time::{Duration, Instant, Timer};
 use esp_hal::{peripherals::WIFI, rng::Rng};
 use esp_radio::{
     wifi::{WifiController, WifiDevice, WifiEvent, WifiStaState},
-    Controller,
 };
-use structs::{AutoSetupSettings, Result, WmInnerSignals, WmReturn};
+use structs::{AutoSetupSettings, WmInnerSignals, WmReturn};
 
 pub use nvs::Nvs;
 pub use structs::{WmError, WmSettings};
 pub use utils::get_efuse_mac;
+
+use crate::wifimanager::nvs::SavedSettings;
 
 mod http;
 mod ap;
@@ -25,68 +24,36 @@ mod nvs;
 mod structs;
 mod utils;
 
-pub const WIFI_NVS_KEY: &[u8] = b"WIFI_SETUP";
-
-macro_rules! mk_static {
-    ($t:ty,$val:expr) => {{
-        static STATIC_CELL: static_cell::StaticCell<$t> = static_cell::StaticCell::new();
-        #[deny(unused_attributes)]
-        let x = STATIC_CELL.uninit().write(($val));
-        x
-    }};
-}
-
 #[allow(clippy::too_many_arguments)]
 pub async fn init_wm(
     settings: WmSettings,
     spawner: &Spawner,
-    nvs: Option<&Nvs>,
+    flash: esp_hal::peripherals::FLASH<'static>,
     mut rng: Rng,
     wifi: WIFI<'static>,
     ap_start_signal: Option<Rc<Signal<NoopRawMutex, ()>>>,
-) -> Result<WmReturn> {
+) -> crate::wifimanager::structs::Result<WmReturn> {
     let generated_ssid = settings.ssid.clone();
 
-    let init = &*mk_static!(Controller<'static>, esp_radio::init()?);
+    let init = crate::mk_static!(Controller<'static>, esp_radio::init()?);
+
     let (mut controller, interfaces) = esp_radio::wifi::new(init, wifi, Default::default())?;
     controller.set_power_saving(esp_radio::wifi::PowerSaveMode::None)?;
 
-    let mut wifi_setup = [0; 1024];
-    let wifi_setup = if let Some(nvs) = nvs {
-        match nvs.get_key(WIFI_NVS_KEY, &mut wifi_setup).await {
-            Ok(_) => {
-                let end_pos = wifi_setup
-                    .iter()
-                    .position(|&x| x == 0x00)
-                    .unwrap_or(wifi_setup.len());
+    let mut storage = SavedSettings::new(flash)?;
 
-                Some(serde_json_core::from_slice::<AutoSetupSettings>(
-                    &wifi_setup[..end_pos],
-                )?)
-            }
-            Err(_) => None,
-        }
-    } else {
-        None
-    };
+    let wifi_setup = storage.load()?;
 
     let mut wifi_connected = false;
-    let mut controller_started = false;
-    if let Some(ref wifi_setup) = wifi_setup {
-        esp_println::println!("Read wifi_setup from flash: {wifi_setup:?}");
-        controller.set_config(&wifi_setup.to_configuration()?)?;
-        controller.start_async().await?;
-        controller_started = true;
 
-        wifi_connected =
-            utils::try_to_wifi_connect(&mut controller, settings.wifi_conn_timeout).await;
-    }
+    esp_println::println!("Read wifi_setup from flash: {wifi_setup:?}");
+    controller.set_config(&wifi_setup.to_configuration()?)?;
+    controller.start_async().await?;
 
-    let data = if wifi_connected {
-        wifi_setup
-            .expect("Shouldnt fail if connected i guesss.")
-            .data
-    } else {
+    wifi_connected =
+        utils::try_to_wifi_connect(&mut controller, settings.wifi_conn_timeout).await;
+
+    if !wifi_connected {
         esp_println::println!("Starting wifimanager with ssid: {generated_ssid}");
 
         let wm_signals = Rc::new(WmInnerSignals::new());
@@ -94,10 +61,10 @@ pub async fn init_wm(
             ap_start_signal.signal(());
         }
 
-        let configuration = esp_radio::wifi::ModeConfig::ApSta(
-            Default::default(),
-            esp_radio::wifi::AccessPointConfig::default().with_ssid(generated_ssid.clone()),
-        );
+        // let configuration = esp_radio::wifi::ModeConfig::ApSta(
+        //     Default::default(),
+        //     esp_radio::wifi::AccessPointConfig::default().with_ssid(generated_ssid.clone()),
+        // );
 
         let configuration = esp_radio::wifi::ModeConfig::Client(Default::default());
 
@@ -107,23 +74,22 @@ pub async fn init_wm(
             &mut rng,
             spawner,
             wm_signals.clone(),
-            settings.clone(),
             interfaces.ap,
         )
         .await?;
 
-        wm_signals
-            .wifi_conn_info_sig
-            .signal(env!("WM_CONN", "missing WM_CONN").as_bytes().to_vec());
+        // wm_signals
+        //     .wifi_conn_info_sig
+        //     .signal(env!("WM_CONN", "missing WM_CONN").as_bytes().to_vec());
 
-        if !controller_started {
-            controller.start_async().await?;
-        }
+        // if !controller_started {
+        //     controller.start_async().await?;
+        // }
 
         let wifi_setup = wifi_connection_worker(
             settings.clone(),
             wm_signals,
-            nvs,
+            storage,
             &mut controller,
             configuration,
         )
@@ -135,8 +101,6 @@ pub async fn init_wm(
             Timer::after_millis(1000).await;
             esp_hal::system::software_reset();
         }
-
-        wifi_setup.data
     };
 
     let sta_config = Config::dhcpv4(Default::default());
@@ -162,7 +126,6 @@ pub async fn init_wm(
     Ok(WmReturn {
         wifi_init: init,
         sta_stack,
-        data,
         ip_address: utils::wifi_wait_for_ip(&sta_stack).await,
 
         stop_signal,
@@ -172,36 +135,23 @@ pub async fn init_wm(
 async fn wifi_connection_worker(
     settings: WmSettings,
     wm_signals: Rc<WmInnerSignals>,
-    nvs: Option<&Nvs>,
+    mut storage: SavedSettings,
     controller: &mut WifiController<'static>,
     mut configuration: esp_radio::wifi::ModeConfig,
-) -> Result<AutoSetupSettings> {
+) -> crate::wifimanager::structs::Result<AutoSetupSettings> {
     let start_time = Instant::now();
     let mut last_scan = Instant::MIN;
     loop {
         if wm_signals.wifi_conn_info_sig.signaled() {
-            let setup_info_buf = wm_signals.wifi_conn_info_sig.wait().await;
-            let setup_info: AutoSetupSettings = serde_json::from_slice(&setup_info_buf)?;
+            let setup_info = wm_signals.wifi_conn_info_sig.wait().await;
 
-            esp_println::println!("trying to connect to: {setup_info:?}");
-            #[cfg(feature = "ap")]
-            {
-                let esp_radio::wifi::ModeConfig::ApSta(ref mut client_conf, _) = configuration
-                else {
-                    return Err(WmError::Other);
-                };
+            esp_println::println!("trying to connect to: {:?}", setup_info);
+            let esp_radio::wifi::ModeConfig::ApSta(ref mut client_conf, _) = configuration
+            else {
+                return Err(WmError::Other);
+            };
 
-                *client_conf = setup_info.to_client_conf()?;
-            }
-
-            #[cfg(not(feature = "ap"))]
-            {
-                let esp_radio::wifi::ModeConfig::Sta(ref mut client_conf) = configuration else {
-                    return Err(WmError::Other);
-                };
-
-                *client_conf = setup_info.to_client_conf()?;
-            }
+            *client_conf = setup_info.to_client_conf()?;
 
             controller.set_config(&configuration)?;
 
@@ -209,10 +159,7 @@ async fn wifi_connection_worker(
                 utils::try_to_wifi_connect(controller, settings.wifi_conn_timeout).await;
 
             if wifi_connected {
-                if let Some(nvs) = nvs {
-                    _ = nvs.invalidate_key(WIFI_NVS_KEY).await;
-                    nvs.append_key(WIFI_NVS_KEY, &setup_info_buf).await?;
-                }
+                storage.save(&setup_info)?;
 
                 esp_hal_dhcp_server::dhcp_close();
 

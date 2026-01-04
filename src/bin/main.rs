@@ -72,9 +72,7 @@ esp_bootloader_esp_idf::esp_app_desc!();
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) {
-    // esp_alloc::heap_allocator!(size: 150 * 1024);
-
-    esp_println::logger::init_logger_from_env();
+    esp_alloc::heap_allocator!(size: 150 * 1024);
 
     let peripherals = esp_hal::init(esp_hal::Config::default());
 
@@ -146,7 +144,7 @@ async fn lum_loop(
 
     loop {
         let pin_value: u16 = adc1.read_oneshot(&mut pin).await;
-        info!("lum {}", pin_value);
+        esp_println::println!("lum {}", pin_value);
 
         Timer::after(Duration::from_secs(1)).await;
     }
@@ -223,7 +221,7 @@ async fn main_loop(stack: Stack<'static>, rtc: Rtc<'_>, spi: &mut Spi<'_, Blocki
     write!(Wrapper::new(&mut buf), "{:.1}&", ha_res.temperature).expect("Can't write");
     canvas.print_5x7(2, 9, unsafe { from_utf8_unchecked(&buf[0..5]) });
     Screen::<8>::draw(spi, &canvas);
-    info!("DISPLAY1");
+    esp_println::println!("DISPLAY1");
 
     let ntp_addrs = stack.dns_query(NTP_SERVER, DnsQueryType::A).await.unwrap();
 
@@ -245,7 +243,7 @@ async fn main_loop(stack: Stack<'static>, rtc: Rtc<'_>, spi: &mut Spi<'_, Blocki
     let now = jiff::Timestamp::from_microsecond(rtc.current_time_us() as i64)
         .unwrap()
         .to_zoned(TIMEZONE);
-    info!("Rtc: {}", now.strftime("%H%M"));
+    esp_println::println!("Rtc: {}", now.strftime("%H%M"));
 
     loop {
         let addr: IpAddr = ntp_addrs[0].into();
@@ -271,15 +269,15 @@ async fn main_loop(stack: Stack<'static>, rtc: Rtc<'_>, spi: &mut Spi<'_, Blocki
                     .unwrap()
                     .to_zoned(TIMEZONE);
 
-                info!("Response: {:?}", time);
+                esp_println::println!("Response: {:?}", time);
 
                 write!(Wrapper::new(&mut buf), "{}", time.strftime("%H:%M")).expect("Can't write");
                 canvas.print_8x8(0, 0, unsafe { from_utf8_unchecked(&buf[0..5]) });
                 Screen::<8>::draw(spi, &canvas);
-                info!("UPDATE");
+                esp_println::println!("UPDATE");
             }
             Err(e) => {
-                error!("Error getting time: {e:?}");
+                esp_println::println!("Error getting time: {e:?}");
             }
         }
 
@@ -327,11 +325,11 @@ async fn access_website(stack: Stack<'_>) -> HAAttributes {
         .headers(&headers);
     let response = http_req.send(&mut buffer).await.unwrap();
 
-    info!("Got response");
+    esp_println::println!("Got response");
     let res = response.body().read_to_end().await.unwrap();
 
     let (data, _remainder) = serde_json_core::from_slice::<HAResponse<'_>>(res).unwrap();
 
-    info!("Temp: {}", data.attributes.temperature);
+    esp_println::println!("Temp: {}", data.attributes.temperature);
     return data.attributes;
 }
