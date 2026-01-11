@@ -2,6 +2,7 @@
 #![no_main]
 
 use b_intime_5::display::{Canvas, Screen};
+use b_intime_5::wifimanager;
 use reqwless::{client::HttpClient, request::RequestBuilder};
 use serde::Deserialize;
 
@@ -87,30 +88,26 @@ async fn main(spawner: Spawner) {
     // rtc.rwdt.enable();
     esp_println::println!("RWDT watchdog enabled!");
 
-    // let rng = esp_hal::rng::Rng::new();
-    // let nvs = esp_hal_wifimanager::Nvs::new(0x9000, 0x6000).unwrap();
+    let rng = esp_hal::rng::Rng::new();
 
-    // let wm_settings = esp_hal_wifimanager::WmSettings {
-    //     ssid: "B-intime-5".into(),
-    //     wifi_conn_timeout: 30000,
-    //     esp_reset_timeout: Some(300000), // 5min
-    //     ..Default::default()
-    // };
+    let wm_settings = wifimanager::WmSettings {
+        ssid: "B-intime-5".into(),
+        wifi_conn_timeout: 30000,
+        esp_reset_timeout: Some(300000), // 5min
+        ..Default::default()
+    };
 
-    // let timg0 = esp_hal::timer::timg::TimerGroup::new(peripherals.TIMG0);
-    // let wifi_res = esp_hal_wifimanager::init_wm(
-    //     wm_settings,
-    //     &spawner,
-    //     Some(&nvs),
-    //     rng.clone(),
-    //     timg0.timer0,
-    //     peripherals.WIFI,
-    //     None,
-    // )
-    // .await
-    // .expect("wm init");
+    let wifi_res = wifimanager::init_wm(
+        wm_settings,
+        &spawner,
+        peripherals.FLASH,
+        rng.clone(),
+        peripherals.WIFI,
+    )
+    .await
+    .expect("wm init");
 
-    // esp_println::println!("wifi_res: {wifi_res:?}");
+    esp_println::println!("wifi_res: {wifi_res:?}");
 
     let config = OutputConfig::default();
     let cs = Output::new(peripherals.GPIO17, Level::High, config);

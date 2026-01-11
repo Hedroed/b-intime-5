@@ -3,7 +3,7 @@ use esp_radio::Controller;
 use core::ops::DerefMut;
 use embassy_executor::Spawner;
 use embassy_net::{Config, Runner, StackResources};
-use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant, Timer};
 use esp_hal::{peripherals::WIFI, rng::Rng};
@@ -31,7 +31,6 @@ pub async fn init_wm(
     flash: esp_hal::peripherals::FLASH<'static>,
     mut rng: Rng,
     wifi: WIFI<'static>,
-    ap_start_signal: Option<Rc<Signal<NoopRawMutex, ()>>>,
 ) -> crate::wifimanager::structs::Result<WmReturn> {
     let generated_ssid = settings.ssid.clone();
 
@@ -44,22 +43,17 @@ pub async fn init_wm(
 
     let wifi_setup = storage.load()?;
 
-    let mut wifi_connected = false;
-
     esp_println::println!("Read wifi_setup from flash: {wifi_setup:?}");
     controller.set_config(&wifi_setup.to_configuration()?)?;
     controller.start_async().await?;
 
-    wifi_connected =
+    let mut wifi_connected =
         utils::try_to_wifi_connect(&mut controller, settings.wifi_conn_timeout).await;
 
     if !wifi_connected {
         esp_println::println!("Starting wifimanager with ssid: {generated_ssid}");
 
         let wm_signals = Rc::new(WmInnerSignals::new());
-        if let Some(ap_start_signal) = ap_start_signal {
-            ap_start_signal.signal(());
-        }
 
         // let configuration = esp_radio::wifi::ModeConfig::ApSta(
         //     Default::default(),
@@ -108,9 +102,9 @@ pub async fn init_wm(
         interfaces.sta,
         sta_config,
         {
-            static STATIC_CELL: static_cell::StaticCell<StackResources<3>> =
+            static STATIC_CELL: static_cell::StaticCell<StackResources<5>> =
                 static_cell::StaticCell::new();
-            STATIC_CELL.uninit().write(StackResources::<3>::new())
+            STATIC_CELL.uninit().write(StackResources::<5>::new())
         },
         rng.random() as u64,
     );

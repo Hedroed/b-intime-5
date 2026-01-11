@@ -13,7 +13,6 @@ pub struct Nvs {
 impl Nvs {
     pub fn new(
         flash: esp_hal::peripherals::FLASH<'static>,
-        flash_offset: u32,
         flash_size: usize,
     ) -> crate::wifimanager::structs::Result<Self> {
 
@@ -38,7 +37,7 @@ impl Nvs {
         esp_println::println!("NVS partition size = {}", nvs_partition.capacity());
 
         Ok(Nvs {
-            offset: flash_offset,
+            offset: 0,
             size: flash_size,
             region: nvs_partition,
         })
@@ -76,7 +75,7 @@ impl SavedSettings {
         flash: esp_hal::peripherals::FLASH<'static>,
     ) -> crate::wifimanager::structs::Result<Self> {
         Ok(Self {
-            nvs: Nvs::new(flash, 0, 1024)?,
+            nvs: Nvs::new(flash, 1024)?,
             buf: [0u8; 1024],
         })
     }
