@@ -2,7 +2,7 @@ use embedded_storage::{ReadStorage, Storage};
 use esp_bootloader_esp_idf::partitions;
 use esp_storage::FlashStorage;
 
-use crate::wifimanager::structs::AutoSetupSettings;
+use super::structs::AutoSetupSettings;
 
 pub struct Nvs {
     offset: u32,
@@ -14,7 +14,7 @@ impl Nvs {
     pub fn new(
         flash: esp_hal::peripherals::FLASH<'static>,
         flash_size: usize,
-    ) -> crate::wifimanager::structs::Result<Self> {
+    ) -> super::structs::Result<Self> {
 
         let flash = crate::mk_static!(FlashStorage<'static>, FlashStorage::new(flash)); // peripherals.FLASH
         esp_println::println!("Flash size = {}", flash.capacity());
@@ -43,13 +43,13 @@ impl Nvs {
         })
     }
 
-    pub async fn write(&mut self, buf: &[u8]) -> crate::wifimanager::structs::Result<()> {
+    pub fn write(&mut self, buf: &[u8]) -> super::structs::Result<()> {
         self.region
             .write(self.offset, &buf[..self.size])?;
         Ok(())
     }
 
-    pub fn read(&mut self, buf: &mut [u8]) -> crate::wifimanager::structs::Result<()> {
+    pub fn read(&mut self, buf: &mut [u8]) -> super::structs::Result<()> {
 
         self.region
             .read(self.offset, buf)?;
@@ -73,14 +73,14 @@ pub struct SavedSettings {
 impl SavedSettings {
     pub fn new(
         flash: esp_hal::peripherals::FLASH<'static>,
-    ) -> crate::wifimanager::structs::Result<Self> {
+    ) -> super::structs::Result<Self> {
         Ok(Self {
             nvs: Nvs::new(flash, 1024)?,
             buf: [0u8; 1024],
         })
     }
 
-    pub fn load(&mut self) -> crate::wifimanager::structs::Result<AutoSetupSettings> {
+    pub fn load(&mut self) -> super::structs::Result<Option<AutoSetupSettings>> {
         let _ = self.nvs.read(&mut self.buf);
 
         let end_pos = self.buf
@@ -88,20 +88,25 @@ impl SavedSettings {
                 .position(|&x| x == 0x00)
                 .unwrap_or(self.buf.len());
 
-        Ok(
-            serde_json_core::from_slice::<AutoSetupSettings>(
-                &self.buf[..end_pos],
-            )?.0
-        )
+        if let Ok((data, _)) = serde_json_core::from_slice::<AutoSetupSettings>(
+            &self.buf[..end_pos],
+        ) {
+            Ok(Some(data))
+        } else {
+            Ok(None)
+        }
     }
 
-    pub fn save(&mut self, settings: &AutoSetupSettings) -> crate::wifimanager::structs::Result<()> {
+    pub fn save(&mut self, settings: &AutoSetupSettings) -> super::structs::Result<()> {
         self.buf.fill(0u8);
 
         serde_json_core::to_slice(
             settings,
             &mut self.buf,
         )?;
+        esp_println::println!("write to nvs: {:?}", self.buf);
+
+        self.nvs.write(&self.buf)?;
 
         Ok(())
     }

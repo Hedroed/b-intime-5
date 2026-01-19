@@ -41,26 +41,23 @@ pub async fn init_wm(
 
     let mut storage = SavedSettings::new(flash)?;
 
-    let wifi_setup = storage.load()?;
+    let wifi_connected = if let Some(wifi_setup) = storage.load()? {
+        esp_println::println!("Read wifi_setup from flash: {wifi_setup:?}");
+        controller.set_config(&wifi_setup.to_configuration()?)?;
+        controller.start_async().await?;
 
-    esp_println::println!("Read wifi_setup from flash: {wifi_setup:?}");
-    controller.set_config(&wifi_setup.to_configuration()?)?;
-    controller.start_async().await?;
-
-    let mut wifi_connected =
-        utils::try_to_wifi_connect(&mut controller, settings.wifi_conn_timeout).await;
+        utils::try_to_wifi_connect(&mut controller, settings.wifi_conn_timeout).await
+    } else { false };
 
     if !wifi_connected {
         esp_println::println!("Starting wifimanager with ssid: {generated_ssid}");
 
         let wm_signals = Rc::new(WmInnerSignals::new());
 
-        // let configuration = esp_radio::wifi::ModeConfig::ApSta(
-        //     Default::default(),
-        //     esp_radio::wifi::AccessPointConfig::default().with_ssid(generated_ssid.clone()),
-        // );
-
-        let configuration = esp_radio::wifi::ModeConfig::Client(Default::default());
+        let configuration = esp_radio::wifi::ModeConfig::ApSta(
+            Default::default(),
+            esp_radio::wifi::AccessPointConfig::default().with_ssid(generated_ssid.clone()),
+        );
 
         controller.set_config(&configuration)?;
 
@@ -72,18 +69,11 @@ pub async fn init_wm(
         )
         .await?;
 
-        // wm_signals
-        //     .wifi_conn_info_sig
-        //     .signal(env!("WM_CONN", "missing WM_CONN").as_bytes().to_vec());
-
-        // if !controller_started {
-        //     controller.start_async().await?;
-        // }
+        controller.start_async().await?;
 
         let wifi_setup = wifi_connection_worker(
             settings.clone(),
             wm_signals,
-            storage,
             &mut controller,
             configuration,
         )
@@ -95,6 +85,8 @@ pub async fn init_wm(
             Timer::after_millis(1000).await;
             esp_hal::system::software_reset();
         }
+
+        storage.save(&wifi_setup)?;
     };
 
     let sta_config = Config::dhcpv4(Default::default());
@@ -129,7 +121,6 @@ pub async fn init_wm(
 async fn wifi_connection_worker(
     settings: WmSettings,
     wm_signals: Rc<WmInnerSignals>,
-    mut storage: SavedSettings,
     controller: &mut WifiController<'static>,
     mut configuration: esp_radio::wifi::ModeConfig,
 ) -> crate::wifimanager::structs::Result<AutoSetupSettings> {
@@ -153,8 +144,6 @@ async fn wifi_connection_worker(
                 utils::try_to_wifi_connect(controller, settings.wifi_conn_timeout).await;
 
             if wifi_connected {
-                storage.save(&setup_info)?;
-
                 esp_hal_dhcp_server::dhcp_close();
 
                 Timer::after_millis(1000).await;

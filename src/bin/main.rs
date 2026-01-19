@@ -6,6 +6,7 @@ use b_intime_5::wifimanager;
 use reqwless::{client::HttpClient, request::RequestBuilder};
 use serde::Deserialize;
 
+use core::u16;
 use core::{
     net::{IpAddr, SocketAddr},
     str::from_utf8_unchecked,
@@ -31,7 +32,7 @@ use esp_hal::{
     Blocking,
 };
 use esp_println::println;
-use sntpc::{get_time, NtpContext, NtpTimestampGenerator};
+use sntpc::{get_time, NtpContext, NtpResult, NtpTimestampGenerator};
 
 // When you are okay with using a nightly compiler it's better to use https://docs.rs/static_cell/2.1.0/static_cell/macro.make_static.html
 // macro_rules! mk_static {
@@ -79,11 +80,12 @@ async fn main(spawner: Spawner) {
 
     esp_println::println!("Init!");
 
-    let sw_int = esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+    let sw_int =
+        esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
 
-    // let rtc = Rtc::new(peripherals.LPWR);
+    let rtc = Rtc::new(peripherals.LPWR);
     // rtc.rwdt.set_timeout(RwdtStage::Stage0, esp_hal::time::Duration::from_millis(2000));
     // rtc.rwdt.enable();
     esp_println::println!("RWDT watchdog enabled!");
@@ -114,7 +116,7 @@ async fn main(spawner: Spawner) {
     let mosi = Output::new(peripherals.GPIO18, Level::High, config);
     let sclk = Output::new(peripherals.GPIO19, Level::High, config);
 
-    let mut _spi = spi::master::Spi::new(
+    let mut spi = spi::master::Spi::new(
         peripherals.SPI2,
         spi::master::Config::default().with_frequency(Rate::from_khz(100)),
     )
@@ -127,23 +129,26 @@ async fn main(spawner: Spawner) {
         .spawn(lum_loop(peripherals.GPIO2, peripherals.ADC1))
         .expect("lum loop");
 
-    // main_loop(wifi_res.sta_stack, rtc, &mut spi).await
+    main_loop(wifi_res.sta_stack, rtc, &mut spi).await
 }
 
 #[embassy_executor::task]
-async fn lum_loop(
-    analog_pin: peripherals::GPIO2<'static>,
-    adc1: peripherals::ADC1<'static>,
-) {
+async fn lum_loop(analog_pin: peripherals::GPIO2<'static>, adc1: peripherals::ADC1<'static>) {
     let mut adc1_config = AdcConfig::new();
     let mut pin = adc1_config.enable_pin(analog_pin, Attenuation::_11dB);
     let mut adc1 = Adc::new(adc1, adc1_config).into_async();
 
+    let mut previous = u16::MIN;
+
     loop {
         let pin_value: u16 = adc1.read_oneshot(&mut pin).await;
-        esp_println::println!("lum {}", pin_value);
+
+        if previous != pin_value {
+            esp_println::println!("new lum {}", pin_value);
+        }
 
         Timer::after(Duration::from_secs(1)).await;
+        previous = pin_value;
     }
 }
 
@@ -156,10 +161,15 @@ struct Wrapper<'a> {
 
 impl<'a> Wrapper<'a> {
     fn new(buf: &'a mut [u8]) -> Self {
+        buf.fill(0u8);
         Wrapper {
             buf: buf,
             offset: 0,
         }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.buf[0..self.offset]
     }
 }
 
@@ -185,12 +195,32 @@ impl<'a> fmt::Write for Wrapper<'a> {
     }
 }
 
-async fn main_loop(stack: Stack<'static>, rtc: Rtc<'_>, spi: &mut Spi<'_, Blocking>) {
-    let mut buf = [0x20 as u8; 20];
+enum LigthLevel {
+    Bright,  // v < 2500
+    Low,  // v < 4090
+    Dark,  // V >= 4090
+}
 
-    let mut canvas = Canvas::<32, 16>::init();
+struct State {
+    rtc: Rtc<'static>,
+    temperature: f32,
+    light_level: LigthLevel,
+}
+
+enum Event {
+    Ntp(NtpResult),
+    Light(LigthLevel),
+    Temperature(f32),
+    Reset,
+}
+
+async fn main_loop(stack: Stack<'static>, rtc: Rtc<'static>, spi: &mut Spi<'static, Blocking>) {
+    let buf = [0x20 as u8; 20];
+
+    let canvas = Canvas::<32, 16>::init();
 
     Screen::<8>::init(spi);
+    let mut view = View { buf, canvas, spi };
 
     let mut rx_meta = [PacketMetadata::EMPTY; 16];
     let mut rx_buffer = [0; 4096];
@@ -215,10 +245,11 @@ async fn main_loop(stack: Stack<'static>, rtc: Rtc<'_>, spi: &mut Spi<'_, Blocki
 
     let ha_res = access_website(stack.clone()).await;
 
-    write!(Wrapper::new(&mut buf), "{:.1}&", ha_res.temperature).expect("Can't write");
-    canvas.print_5x7(2, 9, unsafe { from_utf8_unchecked(&buf[0..5]) });
-    Screen::<8>::draw(spi, &canvas);
-    esp_println::println!("DISPLAY1");
+    let state = State {
+        rtc,
+        temperature: ha_res.temperature,
+        light_level: LigthLevel::Bright,
+    };
 
     let ntp_addrs = stack.dns_query(NTP_SERVER, DnsQueryType::A).await.unwrap();
 
@@ -237,7 +268,7 @@ async fn main_loop(stack: Stack<'static>, rtc: Rtc<'_>, spi: &mut Spi<'_, Blocki
     socket.bind(123).unwrap();
 
     // Display initial Rtc time before synchronization
-    let now = jiff::Timestamp::from_microsecond(rtc.current_time_us() as i64)
+    let now = jiff::Timestamp::from_microsecond(state.rtc.current_time_us() as i64)
         .unwrap()
         .to_zoned(TIMEZONE);
     esp_println::println!("Rtc: {}", now.strftime("%H%M"));
@@ -248,7 +279,7 @@ async fn main_loop(stack: Stack<'static>, rtc: Rtc<'_>, spi: &mut Spi<'_, Blocki
             SocketAddr::from((addr, 123)),
             &socket,
             NtpContext::new(Timestamp {
-                rtc: &rtc,
+                rtc: &state.rtc,
                 current_time_us: 0,
             }),
         )
@@ -257,21 +288,12 @@ async fn main_loop(stack: Stack<'static>, rtc: Rtc<'_>, spi: &mut Spi<'_, Blocki
         match result {
             Ok(time) => {
                 // Set time immediately after receiving to reduce time offset.
-                rtc.set_current_time_us(
+                state.rtc.set_current_time_us(
                     (time.sec() as u64 * USEC_IN_SEC)
                         + ((time.sec_fraction() as u64 * USEC_IN_SEC) >> 32),
                 );
 
-                let time = jiff::Timestamp::from_microsecond(rtc.current_time_us() as i64)
-                    .unwrap()
-                    .to_zoned(TIMEZONE);
-
-                esp_println::println!("Response: {:?}", time);
-
-                write!(Wrapper::new(&mut buf), "{}", time.strftime("%H:%M")).expect("Can't write");
-                canvas.print_8x8(0, 0, unsafe { from_utf8_unchecked(&buf[0..5]) });
-                Screen::<8>::draw(spi, &canvas);
-                esp_println::println!("UPDATE");
+                view.view(&state).await;
             }
             Err(e) => {
                 esp_println::println!("Error getting time: {e:?}");
@@ -279,6 +301,34 @@ async fn main_loop(stack: Stack<'static>, rtc: Rtc<'_>, spi: &mut Spi<'_, Blocki
         }
 
         Timer::after(Duration::from_secs(60)).await;
+    }
+}
+
+struct View<'a> {
+    buf: [u8; 20],
+    canvas: Canvas<32, 16>,
+    spi: &'a mut Spi<'static, Blocking>,
+}
+
+impl<'a> View<'a> {
+    async fn view(&mut self, state: &State) {
+        let time = jiff::Timestamp::from_microsecond(state.rtc.current_time_us() as i64)
+            .unwrap()
+            .to_zoned(TIMEZONE);
+
+        let mut buf = Wrapper::new(&mut self.buf);
+        write!(buf, "{}", time.strftime("%H:%M")).expect("Can't write");
+        self.canvas
+            .print_8x8(0, 0, unsafe { from_utf8_unchecked(&buf.as_bytes()) });
+
+        let mut buf = Wrapper::new(&mut self.buf);
+        write!(buf, "{:.1}&", state.temperature).expect("Can't write");
+        self.canvas
+            .print_5x7(2, 9, unsafe { from_utf8_unchecked(&buf.as_bytes()) });
+
+        Screen::<8>::draw(&mut self.spi, &self.canvas);
+
+        esp_println::println!("UPDATE");
     }
 }
 

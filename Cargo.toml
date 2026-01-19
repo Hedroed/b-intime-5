@@ -23,8 +23,6 @@ embassy-sync = { version = "0.7.2" }
 esp-storage = { version = "0.8.1", features = ["esp32c6", "defmt"] }
 embedded-storage = "0.3.1"
 
-picoserve = { version = "0.17.1", features = ["embassy", "defmt", "alloc"] }
-
 static_cell = { version = "2.1.1", features = ["nightly"] }
 
 esp-bootloader-esp-idf = { version = "0.4.0", features = ["esp32c6", "defmt"] }
