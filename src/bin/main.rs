@@ -2,11 +2,15 @@
 #![no_main]
 
 use b_intime_5::display::{Canvas, Screen};
-use b_intime_5::wifimanager;
+use b_intime_5::{mk_static, wifimanager};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::mutex::Mutex;
+use embassy_sync::signal::Signal;
+use esp_hal::peripherals::Peripherals;
+use esp_hal::tsens::Temperature;
 use reqwless::{client::HttpClient, request::RequestBuilder};
 use serde::Deserialize;
 
-use core::u16;
 use core::{
     net::{IpAddr, SocketAddr},
     str::from_utf8_unchecked,
@@ -31,18 +35,11 @@ use esp_hal::{
     timer::timg::TimerGroup,
     Blocking,
 };
-use esp_println::println;
-use sntpc::{get_time, NtpContext, NtpResult, NtpTimestampGenerator};
+use sntpc::{get_time, NtpContext, NtpTimestampGenerator};
 
-// When you are okay with using a nightly compiler it's better to use https://docs.rs/static_cell/2.1.0/static_cell/macro.make_static.html
-// macro_rules! mk_static {
-//     ($t:ty,$val:expr) => {{
-//         static STATIC_CELL: static_cell::StaticCell<$t> = static_cell::StaticCell::new();
-//         #[deny(unused_attributes)]
-//         let x = STATIC_CELL.uninit().write(($val));
-//         x
-//     }};
-// }
+type SharedRtc = Mutex<CriticalSectionRawMutex, Rtc<'static>>;
+type SharedTemperature = Mutex<CriticalSectionRawMutex, Option<f32>>;
+type SharedLightlevel = Mutex<CriticalSectionRawMutex, u16>;
 
 const TIMEZONE: jiff::tz::TimeZone = jiff::tz::get!("Europe/Paris");
 const NTP_SERVER: &str = "pool.ntp.org";
@@ -85,11 +82,6 @@ async fn main(spawner: Spawner) {
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
 
-    let rtc = Rtc::new(peripherals.LPWR);
-    // rtc.rwdt.set_timeout(RwdtStage::Stage0, esp_hal::time::Duration::from_millis(2000));
-    // rtc.rwdt.enable();
-    esp_println::println!("RWDT watchdog enabled!");
-
     let rng = esp_hal::rng::Rng::new();
 
     let wm_settings = wifimanager::WmSettings {
@@ -103,13 +95,15 @@ async fn main(spawner: Spawner) {
         wm_settings,
         &spawner,
         peripherals.FLASH,
-        rng.clone(),
+        rng,
         peripherals.WIFI,
     )
     .await
     .expect("wm init");
 
     esp_println::println!("wifi_res: {wifi_res:?}");
+
+    let stack = wifi_res.sta_stack;
 
     let config = OutputConfig::default();
     let cs = Output::new(peripherals.GPIO17, Level::High, config);
@@ -125,55 +119,106 @@ async fn main(spawner: Spawner) {
     .with_mosi(mosi)
     .with_cs(cs);
 
+    let rtc = Rtc::new(peripherals.LPWR);
+
+    Screen::<8>::init(&mut spi);
+
+    let buf = [0x20_u8; 20];
+    let canvas = Canvas::<32, 16>::init();
+    let mut view = View { buf, canvas, spi: &mut spi };
+
+    // let mut a = Animation::default();
+    // view.wifi_loading(&mut a).await;
+
+    let mutex_rtx = mk_static!(SharedRtc, Mutex::new(rtc));
+    let temperature = mk_static!(SharedTemperature, Mutex::new(None));
+    let light = mk_static!(SharedLightlevel, Mutex::new(0));
+
     spawner
-        .spawn(lum_loop(peripherals.GPIO2, peripherals.ADC1))
+        .spawn(lum_loop(peripherals.GPIO2, peripherals.ADC1, light))
         .expect("lum loop");
 
-    main_loop(wifi_res.sta_stack, rtc, &mut spi).await
+    spawner
+        .spawn(ha_temperature_loop(stack, temperature))
+        .expect("temp loop");
+
+    spawner
+        .spawn(ntp_loop(stack, mutex_rtx))
+        .expect("ntp loop");
+
+    loop {
+        view.view(mutex_rtx, temperature, light).await;
+        Timer::after(Duration::from_secs(17)).await;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LigthLevel {
+    Bright, // v < 2500
+    Low,    // v < 4090
+    Dark,   // v >= 4090
+}
+
+impl From<u16> for LigthLevel {
+    fn from(value: u16) -> Self {
+        match value {
+            n if n < 3000 => LigthLevel::Bright,
+            n if n < 4090 => LigthLevel::Low,
+            _ => LigthLevel::Dark,
+        }
+    }
 }
 
 #[embassy_executor::task]
-async fn lum_loop(analog_pin: peripherals::GPIO2<'static>, adc1: peripherals::ADC1<'static>) {
+async fn lum_loop(analog_pin: peripherals::GPIO2<'static>, adc1: peripherals::ADC1<'static>, light: &'static SharedLightlevel) {
     let mut adc1_config = AdcConfig::new();
     let mut pin = adc1_config.enable_pin(analog_pin, Attenuation::_11dB);
     let mut adc1 = Adc::new(adc1, adc1_config).into_async();
 
-    let mut previous = u16::MIN;
+    let mut previous = 0u16;
 
     loop {
-        let pin_value: u16 = adc1.read_oneshot(&mut pin).await;
+        let pin_value = adc1.read_oneshot(&mut pin).await;
 
         if previous != pin_value {
-            esp_println::println!("new lum {}", pin_value);
+            // esp_println::println!("new lum {:?}", pin_value);
+
+            let mut l = light.lock().await;
+            *l = pin_value;
         }
 
-        Timer::after(Duration::from_secs(1)).await;
+        Timer::after(Duration::from_secs(7)).await;
         previous = pin_value;
     }
 }
 
 use core::fmt::{self, Write};
 
-struct Wrapper<'a> {
+struct BufWriter<'a> {
     buf: &'a mut [u8],
     pub offset: usize,
 }
 
-impl<'a> Wrapper<'a> {
+impl<'a> BufWriter<'a> {
     fn new(buf: &'a mut [u8]) -> Self {
         buf.fill(0u8);
-        Wrapper {
-            buf: buf,
+        BufWriter {
+            buf,
             offset: 0,
         }
     }
 
-    fn as_bytes(&self) -> &[u8] {
-        &self.buf[0..self.offset]
+    fn len(&self) -> usize {
+        self.offset
+    }
+
+    // Returns the original buffer (consumed)
+    fn into_inner(self) -> &'a mut [u8] {
+        self.buf
     }
 }
 
-impl<'a> fmt::Write for Wrapper<'a> {
+impl<'a> fmt::Write for BufWriter<'a> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         let bytes = s.as_bytes();
 
@@ -195,61 +240,124 @@ impl<'a> fmt::Write for Wrapper<'a> {
     }
 }
 
-enum LigthLevel {
-    Bright,  // v < 2500
-    Low,  // v < 4090
-    Dark,  // V >= 4090
+struct View<'a> {
+    buf: [u8; 20],
+    canvas: Canvas<32, 16>,
+    spi: &'a mut Spi<'static, Blocking>,
 }
 
-struct State {
-    rtc: Rtc<'static>,
-    temperature: f32,
-    light_level: LigthLevel,
+#[derive(Default)]
+struct Animation<const T: u32> {
+    acc: u32
 }
 
-enum Event {
-    Ntp(NtpResult),
-    Light(LigthLevel),
-    Temperature(f32),
-    Reset,
+impl<const T: u32> Animation<T> {
+    pub fn step(&mut self) -> u32 {
+        let ret = self.acc;
+
+        self.acc += 1;
+        if self.acc >= T {
+            self.acc = 0;
+        }
+
+        ret
+    }
 }
 
-async fn main_loop(stack: Stack<'static>, rtc: Rtc<'static>, spi: &mut Spi<'static, Blocking>) {
-    let buf = [0x20 as u8; 20];
+fn write_buffered<'a>(buf: &'a mut [u8], format: fmt::Arguments) -> &'a str {
+    let mut writer = BufWriter::new(buf);
 
-    let canvas = Canvas::<32, 16>::init();
+    write!(writer, "{}", format).expect("Can't write");
 
-    Screen::<8>::init(spi);
-    let mut view = View { buf, canvas, spi };
+    let len = writer.len();
+
+    unsafe { from_utf8_unchecked(&writer.into_inner()[..len]) }
+}
+
+impl<'a> View<'a> {
+    async fn view(&mut self, rtc: &SharedRtc, temperature: &SharedTemperature, light: &SharedLightlevel) {
+
+        let time = {
+            let rtc_lock = rtc.lock().await;
+            jiff::Timestamp::from_microsecond(rtc_lock.current_time_us() as i64)
+            .unwrap()
+            .to_zoned(TIMEZONE)
+        };
+
+        let light_level = light.lock().await;
+        let temperature = temperature.lock().await;
+
+        self.canvas.clear();
+
+        if *light_level > 1000 {
+            self.canvas.set_pixel(31, 14, true);
+        }
+        if *light_level > 2000 {
+            self.canvas.set_pixel(31, 13, true);
+        }
+        if *light_level > 2500 {
+            self.canvas.set_pixel(31, 12, true);
+        }
+        if *light_level > 3000 {
+            self.canvas.set_pixel(31, 11, true);
+        }
+        if *light_level > 3500 {
+            self.canvas.set_pixel(31, 10, true);
+        }
+        if *light_level > 4000 {
+            self.canvas.set_pixel(31, 9, true);
+        }
+
+        let text = write_buffered(&mut self.buf, format_args!("{}", time.strftime("%H:%M")));
+        let light_range: LigthLevel = (*light_level).into();
+        match light_range {
+            LigthLevel::Bright => {
+                self.canvas.print_8x8(0, 0, text);
+            }
+            LigthLevel::Low => {
+                self.canvas.print_5x7(4, 2, text);
+            }
+            LigthLevel::Dark => {
+                self.canvas.print_4x4(6, 3, text);
+            }
+        }
+
+        let text = if let Some(temperature) = *temperature {
+            write_buffered(&mut self.buf, format_args!("{:.1}&", temperature))
+        } else {
+            "N/A&"
+        };
+
+        if light_range == LigthLevel::Bright {
+            self.canvas.print_5x7(2, 9, text);
+        }
+
+        Screen::<8>::draw(self.spi, &self.canvas);
+
+        esp_println::println!("UPDATE");
+    }
+
+    async fn wifi_loading(&mut self, anim: &mut Animation<3>) {
+        let setp = anim.step();
+
+        self.canvas.clear();
+
+        let text = write_buffered(&mut self.buf, format_args!("wifi: {}", setp));
+        self.canvas.print_5x7(3, 2, text);
+
+        Screen::<8>::draw(self.spi, &self.canvas);
+
+        esp_println::println!("wifi_loading {}", setp);
+    }
+}
+
+#[embassy_executor::task]
+async fn ntp_loop(stack: Stack<'static>, rtc: &'static SharedRtc) -> ! {
 
     let mut rx_meta = [PacketMetadata::EMPTY; 16];
     let mut rx_buffer = [0; 4096];
     let mut tx_meta = [PacketMetadata::EMPTY; 16];
     let mut tx_buffer = [0; 4096];
-
-    loop {
-        if stack.is_link_up() {
-            break;
-        }
-        Timer::after(Duration::from_millis(500)).await;
-    }
-
-    println!("Waiting to get IP address...");
-    loop {
-        if let Some(config) = stack.config_v4() {
-            println!("Got IP: {}", config.address);
-            break;
-        }
-        Timer::after(Duration::from_millis(500)).await;
-    }
-
-    let ha_res = access_website(stack.clone()).await;
-
-    let state = State {
-        rtc,
-        temperature: ha_res.temperature,
-        light_level: LigthLevel::Bright,
-    };
 
     let ntp_addrs = stack.dns_query(NTP_SERVER, DnsQueryType::A).await.unwrap();
 
@@ -267,68 +375,37 @@ async fn main_loop(stack: Stack<'static>, rtc: Rtc<'static>, spi: &mut Spi<'stat
 
     socket.bind(123).unwrap();
 
-    // Display initial Rtc time before synchronization
-    let now = jiff::Timestamp::from_microsecond(state.rtc.current_time_us() as i64)
-        .unwrap()
-        .to_zoned(TIMEZONE);
-    esp_println::println!("Rtc: {}", now.strftime("%H%M"));
-
     loop {
         let addr: IpAddr = ntp_addrs[0].into();
-        let result = get_time(
-            SocketAddr::from((addr, 123)),
-            &socket,
-            NtpContext::new(Timestamp {
-                rtc: &state.rtc,
-                current_time_us: 0,
-            }),
-        )
-        .await;
+
+        let result = {
+            let rtc_lock = rtc.lock().await;
+            get_time(
+                SocketAddr::from((addr, 123)),
+                &socket,
+                NtpContext::new(Timestamp {
+                    rtc: &rtc_lock,
+                    current_time_us: 0,
+                }),
+            )
+            .await
+        };
 
         match result {
             Ok(time) => {
+                let rtc_lock = rtc.lock().await;
+
                 // Set time immediately after receiving to reduce time offset.
-                state.rtc.set_current_time_us(
+                rtc_lock.set_current_time_us(
                     (time.sec() as u64 * USEC_IN_SEC)
                         + ((time.sec_fraction() as u64 * USEC_IN_SEC) >> 32),
                 );
-
-                view.view(&state).await;
             }
             Err(e) => {
                 esp_println::println!("Error getting time: {e:?}");
             }
         }
-
-        Timer::after(Duration::from_secs(60)).await;
-    }
-}
-
-struct View<'a> {
-    buf: [u8; 20],
-    canvas: Canvas<32, 16>,
-    spi: &'a mut Spi<'static, Blocking>,
-}
-
-impl<'a> View<'a> {
-    async fn view(&mut self, state: &State) {
-        let time = jiff::Timestamp::from_microsecond(state.rtc.current_time_us() as i64)
-            .unwrap()
-            .to_zoned(TIMEZONE);
-
-        let mut buf = Wrapper::new(&mut self.buf);
-        write!(buf, "{}", time.strftime("%H:%M")).expect("Can't write");
-        self.canvas
-            .print_8x8(0, 0, unsafe { from_utf8_unchecked(&buf.as_bytes()) });
-
-        let mut buf = Wrapper::new(&mut self.buf);
-        write!(buf, "{:.1}&", state.temperature).expect("Can't write");
-        self.canvas
-            .print_5x7(2, 9, unsafe { from_utf8_unchecked(&buf.as_bytes()) });
-
-        Screen::<8>::draw(&mut self.spi, &self.canvas);
-
-        esp_println::println!("UPDATE");
+        Timer::after(Duration::from_secs(119)).await;
     }
 }
 
@@ -345,9 +422,8 @@ struct HAAttributes {
     wind_speed: f32,
 }
 
-async fn access_website(stack: Stack<'_>) -> HAAttributes {
-    let mut rx_buffer = [0; 4096];
-    let mut tx_buffer = [0; 4096];
+#[embassy_executor::task]
+async fn ha_temperature_loop(stack: Stack<'static>, temperature: &'static SharedTemperature) -> ! {
     let dns = DnsSocket::new(stack);
     let tcp_state = TcpClientState::<1, 4096, 4096>::new();
     let tcp = TcpClient::new(stack, &tcp_state);
@@ -362,21 +438,56 @@ async fn access_website(stack: Stack<'_>) -> HAAttributes {
 
     let mut client = HttpClient::new(&tcp, &dns);
     let mut buffer = [0u8; 4096];
-    let mut http_req = client
-        .request(
-            reqwless::request::Method::GET,
-            env!("HA_URI", "no home assistant uri provided"),
-        )
-        .await
-        .unwrap()
-        .headers(&headers);
-    let response = http_req.send(&mut buffer).await.unwrap();
+    
+    loop {
+        let mut http_req = client
+            .request(
+                reqwless::request::Method::GET,
+                env!("HA_URI", "no home assistant uri provided"),
+            )
+            .await
+            .unwrap()
+            .headers(&headers);
+        
+        let response = match http_req.send(&mut buffer).await {
+            Ok(response) => {
+                response
+            },
+            Err(err) => {
+                esp_println::println!("HA error 1: {:?}", err);
+                continue;
+            },
+        };
 
-    esp_println::println!("Got response");
-    let res = response.body().read_to_end().await.unwrap();
+        esp_println::println!("Got response");
+        let res = match response.body().read_to_end().await {
+            Ok(res) => res,
+            Err(err) => {
+                esp_println::println!("HA error 2: {:?}", err);
+                continue;
+            },
+        };
 
-    let (data, _remainder) = serde_json_core::from_slice::<HAResponse<'_>>(res).unwrap();
+        match serde_json_core::from_slice::<HAResponse<'_>>(res) {
+            Ok((data, _remainder)) => {
+                esp_println::println!("Temp: {}", data.attributes.temperature);
 
-    esp_println::println!("Temp: {}", data.attributes.temperature);
-    return data.attributes;
+                {
+                    let mut t = temperature.lock().await;
+                    *t = Some(data.attributes.temperature);
+                }
+
+            },
+            Err(err) => {
+                esp_println::println!("HA error 3: {}", err);
+                {
+                    let mut t = temperature.lock().await;
+                    *t = None;
+                }
+            },
+        }
+
+
+        Timer::after(Duration::from_secs(10 * 60)).await;
+    }
 }

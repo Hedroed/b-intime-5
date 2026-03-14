@@ -1,22 +1,43 @@
 [package]
-edition      = "2021"
-name         = "b-intime-5"
+edition = "2021"
+name = "b-intime-5"
 rust-version = "1.86"
-version      = "0.1.0"
+version = "0.1.0"
 
 [[bin]]
 name = "b-intime-5"
 path = "./src/bin/main.rs"
 
 [dependencies]
-esp-backtrace = { version = "0.18.1", features = [ "esp32c6", "panic-handler", "defmt" ] }
-esp-hal = { version = "1.0.0", features = [ "esp32c6", "unstable", "defmt" ] }
-esp-println = { version = "0.16.1", features = ["esp32c6", "defmt-espflash"] }
-esp-radio = { version = "0.17.0", features = [ "esp32c6", "wifi", "defmt"] }
-esp-rtos = { version = "0.2.0", features = ["esp32c6", "embassy", "esp-radio", "defmt"] }
+esp-backtrace = { version = "0.18.1", features = [
+    "esp32c6",
+    "panic-handler",
+    "defmt",
+] }
+esp-hal = { version = "1.0.0", features = ["esp32c6", "unstable", "defmt"] }
+esp-println = { version = "0.16.1", default-features = false, features = [
+    "esp32c6",
+    "defmt-espflash",
+    "auto",
+] }
+esp-radio = { version = "0.17.0", features = ["esp32c6", "wifi", "defmt"] }
+esp-rtos = { version = "0.2.0", features = [
+    "esp32c6",
+    "embassy",
+    "esp-radio",
+    "defmt",
+] }
 
 embassy-executor = { version = "0.9.1", features = ["defmt"] }
-embassy-net = { version = "0.7.1", features = ["tcp", "udp", "dhcpv4", "medium-ethernet", "proto-ipv4", "dns", "defmt"] }
+embassy-net = { version = "0.7.1", features = [
+    "tcp",
+    "udp",
+    "dhcpv4",
+    "medium-ethernet",
+    "proto-ipv4",
+    "dns",
+    "defmt",
+] }
 embassy-time = { version = "0.5.0" }
 embassy-sync = { version = "0.7.2" }
 
@@ -28,13 +49,20 @@ static_cell = { version = "2.1.1", features = ["nightly"] }
 esp-bootloader-esp-idf = { version = "0.4.0", features = ["esp32c6", "defmt"] }
 
 jiff = { version = "0.2.10", default-features = false, features = ["static"] }
-sntpc = { version = "0.7.0", default-features = false, features = ["embassy-socket"] }
+sntpc = { version = "0.7.0", default-features = false, features = [
+    "embassy-socket",
+] }
 
 reqwless = { version = "0.13.0", default-features = false, features = [] }
-serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
+serde = { version = "1.0", default-features = false, features = [
+    "derive",
+    "alloc",
+] }
 serde-json-core = "0.6.0"
 esp-hal-dhcp-server = { version = "0.2.7", default-features = false }
-embassy-futures = { version = "0.1.2", default-features = false, features = ["defmt"] }
+embassy-futures = { version = "0.1.2", default-features = false, features = [
+    "defmt",
+] }
 esp-alloc = { version = "0.9.0", features = ["defmt", "esp32c6"] }
 
 [profile.dev]
@@ -43,10 +71,10 @@ esp-alloc = { version = "0.9.0", features = ["defmt", "esp32c6"] }
 opt-level = "s"
 
 [profile.release]
-codegen-units    = 1     # LLVM can perform better optimizations using a single thread
-debug            = 2
+codegen-units = 1        # LLVM can perform better optimizations using a single thread
+debug = 2
 debug-assertions = false
-incremental      = false
-lto              = 'fat'
-opt-level        = 's'
-overflow-checks  = false
+incremental = false
+lto = 'fat'
+opt-level = 's'
+overflow-checks = false

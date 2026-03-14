@@ -3,7 +3,9 @@ use esp_hal::{spi::master::Spi, Blocking};
 use crate::font::{Font, ALPHABET_BIG_DIGITS, ALPHABET_NANO, ALPHABET_NORMAL, ALPHABET_TINY};
 
 #[derive(Clone, Copy)]
+#[derive(Default)]
 pub enum Command {
+    #[default]
     Noop = 0x00,
     Digit0 = 0x01,
     Digit1 = 0x02,
@@ -36,11 +38,6 @@ pub static NOOP: Order = Order {
     data: 0,
 };
 
-impl Default for Command {
-    fn default() -> Self {
-        Command::Noop
-    }
-}
 
 #[derive(Clone, Copy, Default)]
 pub struct Order {
@@ -79,11 +76,7 @@ impl<const W: usize, const H: usize> Canvas<W, H> {
         }
 
         for idx_bits in 0..(W - x).min(8) {
-            if line >> (7 - idx_bits) & 0b1 == 1 {
-                self.0[x + idx_bits][y] = true;
-            } else {
-                self.0[x + idx_bits][y] = false;
-            }
+            self.0[x + idx_bits][y] = line >> (7 - idx_bits) & 0b1 == 1;
         }
     }
 
@@ -143,6 +136,12 @@ impl<const W: usize, const H: usize> Canvas<W, H> {
         // }
         buf
     }
+    
+    pub fn clear(&mut self) {
+        for col in self.0.iter_mut() {
+            col.fill(false);
+        }
+    }
 }
 
 pub struct Screen<const N: usize> {}
@@ -190,7 +189,7 @@ impl<const N: usize> Screen<N> {
         for (idx_data, val) in data.iter().enumerate() {
             let idx = idx_data * 2;
             buf[idx] = command as u8;
-            buf[idx + 1] = val.clone();
+            buf[idx + 1] = *val;
         }
         spi.write(&buf[0..(2 * N)]).expect("spi write fail");
     }
@@ -201,7 +200,7 @@ impl<const N: usize> Screen<N> {
     ) {
         let raw = canvas.to_raw::<N>();
         for (idx_digit, cmd) in COMMAND_DIGITS.iter().enumerate() {
-            Screen::send(spi, cmd.clone(), &raw[idx_digit]);
+            Screen::send(spi, *cmd, &raw[idx_digit]);
         }
     }
 }

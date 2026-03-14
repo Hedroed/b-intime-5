@@ -1,9 +1,9 @@
 
 const fn build_glyph(width: u8, val: u64) -> Glyph {
-    return Glyph {
+    Glyph {
         width,
         data: val.to_be_bytes(),
-    };
+    }
 }
 
 pub struct Glyph {
@@ -44,7 +44,7 @@ impl<const N: usize> Font<N> {
 
     pub fn width_of_unchecked(&self, val: char) -> u8 {
         let idx = val as u8 - self.lower;
-        return self.glyphs[idx as usize].width;
+        self.glyphs[idx as usize].width
     }
 
     pub fn width_of(&self, val: char) -> u8 {
@@ -57,7 +57,7 @@ impl<const N: usize> Font<N> {
     
     pub fn to_line_unchecked(&self, position: usize, val: char) -> u8 {
         let idx = val as u8 - self.lower;
-        return self.glyphs[idx as usize].data[position]
+        self.glyphs[idx as usize].data[position]
     }
 
     pub fn to_line(&self, position: usize, val: char) -> u8 {

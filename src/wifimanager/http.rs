@@ -121,7 +121,7 @@ async fn web_task(
             }
 
             if total_read == 0 {
-                let _ = socket.close();
+                socket.close();
                 continue;
             }
 
@@ -145,7 +145,7 @@ async fn web_task(
                 }
             }
 
-            let _ = socket.close();
+            socket.close();
         }
     };
 
