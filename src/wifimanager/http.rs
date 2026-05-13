@@ -99,20 +99,42 @@ async fn web_task(
                 continue;
             }
 
-            // read req
             let mut total_read = 0;
+            let mut expected_length: Option<usize> = None;
             loop {
                 match socket.read(&mut http_buffer[total_read..]).await {
                     Ok(0) => break,
                     Ok(n) => {
                         total_read += n;
-                        if http_buffer[..total_read]
+                        
+                        if let Some(expected) = expected_length {
+                            if total_read >= expected || total_read >= HTTP_BUFFER_SIZE {
+                                break;
+                            }
+                        } else if let Some(header_end) = http_buffer[..total_read]
                             .windows(4)
-                            .any(|w| w == b"\r\n\r\n")
+                            .position(|w| w == b"\r\n\r\n")
                         {
-                            break;
-                        }
-                        if total_read >= HTTP_BUFFER_SIZE {
+                            let mut content_len = 0;
+                            if let Ok(headers_str) = core::str::from_utf8(&http_buffer[..header_end]) {
+                                for line in headers_str.lines() {
+                                    let lower_line = line.to_ascii_lowercase();
+                                    if lower_line.starts_with("content-length:") {
+                                        if let Some(len_str) = lower_line.split(':').nth(1) {
+                                            if let Ok(len) = len_str.trim().parse::<usize>() {
+                                                content_len = len;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            let expected = header_end + 4 + content_len;
+                            expected_length = Some(expected);
+                            
+                            if total_read >= expected || total_read >= HTTP_BUFFER_SIZE {
+                                break;
+                            }
+                        } else if total_read >= HTTP_BUFFER_SIZE {
                             break;
                         }
                     }

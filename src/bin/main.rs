@@ -5,9 +5,6 @@ use b_intime_5::display::{Canvas, Screen};
 use b_intime_5::{mk_static, wifimanager};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
-use embassy_sync::signal::Signal;
-use esp_hal::peripherals::Peripherals;
-use esp_hal::tsens::Temperature;
 use reqwless::{client::HttpClient, request::RequestBuilder};
 use serde::Deserialize;
 
@@ -114,7 +111,7 @@ async fn main(spawner: Spawner) {
         peripherals.SPI2,
         spi::master::Config::default().with_frequency(Rate::from_khz(100)),
     )
-    .unwrap()
+    .expect("Failed to initialize SPI")
     .with_sck(sclk)
     .with_mosi(mosi)
     .with_cs(cs);
@@ -246,6 +243,7 @@ struct View<'a> {
     spi: &'a mut Spi<'static, Blocking>,
 }
 
+#[allow(dead_code)]
 #[derive(Default)]
 struct Animation<const T: u32> {
     acc: u32
@@ -279,9 +277,10 @@ impl<'a> View<'a> {
 
         let time = {
             let rtc_lock = rtc.lock().await;
-            jiff::Timestamp::from_microsecond(rtc_lock.current_time_us() as i64)
-            .unwrap()
-            .to_zoned(TIMEZONE)
+            match jiff::Timestamp::from_microsecond(rtc_lock.current_time_us() as i64) {
+                Ok(t) => t.to_zoned(TIMEZONE),
+                Err(_) => jiff::Timestamp::from_second(0).unwrap().to_zoned(TIMEZONE),
+            }
         };
 
         let light_level = light.lock().await;
@@ -337,6 +336,7 @@ impl<'a> View<'a> {
         esp_println::println!("UPDATE");
     }
 
+    #[allow(dead_code)]
     async fn wifi_loading(&mut self, anim: &mut Animation<3>) {
         let setp = anim.step();
 
@@ -359,12 +359,6 @@ async fn ntp_loop(stack: Stack<'static>, rtc: &'static SharedRtc) -> ! {
     let mut tx_meta = [PacketMetadata::EMPTY; 16];
     let mut tx_buffer = [0; 4096];
 
-    let ntp_addrs = stack.dns_query(NTP_SERVER, DnsQueryType::A).await.unwrap();
-
-    if ntp_addrs.is_empty() {
-        panic!("Failed to resolve DNS. Empty result");
-    }
-
     let mut socket = UdpSocket::new(
         stack,
         &mut rx_meta,
@@ -373,9 +367,24 @@ async fn ntp_loop(stack: Stack<'static>, rtc: &'static SharedRtc) -> ! {
         &mut tx_buffer,
     );
 
-    socket.bind(123).unwrap();
+    if let Err(e) = socket.bind(123) {
+        esp_println::println!("NTP bind error: {e:?}");
+    }
 
     loop {
+        let ntp_addrs = match stack.dns_query(NTP_SERVER, DnsQueryType::A).await {
+            Ok(addrs) if !addrs.is_empty() => addrs,
+            Err(err) => {
+                esp_println::println!("Failed to resolve NTP DNS {:?}. Retrying...", err);
+                Timer::after(Duration::from_secs(119)).await;
+                continue;
+            }
+            _ => {
+                esp_println::println!("Failed to resolve NTP DNS. Retrying...");
+                Timer::after(Duration::from_secs(119)).await;
+                continue;
+            }
+        };
         let addr: IpAddr = ntp_addrs[0].into();
 
         let result = {
@@ -411,6 +420,7 @@ async fn ntp_loop(stack: Stack<'static>, rtc: &'static SharedRtc) -> ! {
 
 #[derive(Deserialize, Clone)]
 struct HAResponse<'a> {
+    #[allow(dead_code)]
     state: &'a str,
     attributes: HAAttributes,
 }
@@ -418,7 +428,9 @@ struct HAResponse<'a> {
 #[derive(Deserialize, Clone)]
 struct HAAttributes {
     temperature: f32,
+    #[allow(dead_code)]
     humidity: usize,
+    #[allow(dead_code)]
     wind_speed: f32,
 }
 
@@ -440,14 +452,21 @@ async fn ha_temperature_loop(stack: Stack<'static>, temperature: &'static Shared
     let mut buffer = [0u8; 4096];
     
     loop {
-        let mut http_req = client
+        let http_req_res = client
             .request(
                 reqwless::request::Method::GET,
                 env!("HA_URI", "no home assistant uri provided"),
             )
-            .await
-            .unwrap()
-            .headers(&headers);
+            .await;
+
+        let mut http_req = match http_req_res {
+            Ok(req) => req.headers(&headers),
+            Err(err) => {
+                esp_println::println!("HA request init error: {:?}", err);
+                Timer::after(Duration::from_secs(10 * 60)).await;
+                continue;
+            }
+        };
         
         let response = match http_req.send(&mut buffer).await {
             Ok(response) => {

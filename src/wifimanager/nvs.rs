@@ -20,18 +20,19 @@ impl Nvs {
         esp_println::println!("Flash size = {}", flash.capacity());
 
         let pt_mem = crate::mk_static!([u8; partitions::PARTITION_TABLE_MAX_LEN], [0u8; partitions::PARTITION_TABLE_MAX_LEN]);
-        let pt = partitions::read_partition_table(flash, pt_mem).unwrap();
+        let pt = partitions::read_partition_table(flash, pt_mem).map_err(|_| super::structs::WmError::NvsError)?;
 
         for i in 0..pt.len() {
-            let raw = pt.get_partition(i).unwrap();
-            esp_println::println!("{:?}", raw);
+            if let Ok(raw) = pt.get_partition(i) {
+                esp_println::println!("{:?}", raw);
+            }
         }
 
         let nvs = pt
         .find_partition(partitions::PartitionType::Data(
             partitions::DataPartitionSubType::Nvs,
         ))?
-        .unwrap();
+        .ok_or(super::structs::WmError::NvsError)?;
 
         let nvs_partition = nvs.as_embedded_storage(flash);
         esp_println::println!("NVS partition size = {}", nvs_partition.capacity());
