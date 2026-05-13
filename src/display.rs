@@ -2,8 +2,7 @@ use esp_hal::{spi::master::Spi, Blocking};
 
 use crate::font::{Font, ALPHABET_BIG_DIGITS, ALPHABET_NANO, ALPHABET_NORMAL, ALPHABET_TINY};
 
-#[derive(Clone, Copy)]
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub enum Command {
     #[default]
     Noop = 0x00,
@@ -37,7 +36,6 @@ pub static NOOP: Order = Order {
     command: Command::Noop,
     data: 0,
 };
-
 
 #[derive(Clone, Copy, Default)]
 pub struct Order {
@@ -136,7 +134,7 @@ impl<const W: usize, const H: usize> Canvas<W, H> {
         // }
         buf
     }
-    
+
     pub fn clear(&mut self) {
         for col in self.0.iter_mut() {
             col.fill(false);

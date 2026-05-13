@@ -49,10 +49,7 @@ fn create_http_response(status: &str, content_type: &str, body: &str) -> Vec<u8>
     response
 }
 
-async fn handle_request(
-    request: HttpRequest<'_>,
-    signals: &Rc<WmInnerSignals>,
-) -> Vec<u8> {
+async fn handle_request(request: HttpRequest<'_>, signals: &Rc<WmInnerSignals>) -> Vec<u8> {
     match (request.method, request.path) {
         ("GET", "/") => create_http_response("200 OK", "text/html", include_str!("./panel.html")),
         ("GET", "/list") => {
@@ -66,9 +63,7 @@ async fn handle_request(
         ("POST", "/setup") => {
             let body_vec = request.body.to_vec();
 
-            if let Ok((settings, _)) = serde_json_core::from_slice::<AutoSetupSettings>(
-                &body_vec,
-            ) {
+            if let Ok((settings, _)) = serde_json_core::from_slice::<AutoSetupSettings>(&body_vec) {
                 signals.wifi_conn_info_sig.signal(settings);
                 create_http_response("200 OK", "text/plain", ".")
             } else {
@@ -80,11 +75,7 @@ async fn handle_request(
 }
 
 #[embassy_executor::task(pool_size = WEB_TASK_POOL_SIZE)]
-async fn web_task(
-    _id: usize,
-    stack: Stack<'static>,
-    signals: Rc<WmInnerSignals>,
-) {
+async fn web_task(_id: usize, stack: Stack<'static>, signals: Rc<WmInnerSignals>) {
     let fut = async {
         let mut rx_buffer = [0; 1024];
         let mut tx_buffer = [0; 1024];
@@ -106,7 +97,7 @@ async fn web_task(
                     Ok(0) => break,
                     Ok(n) => {
                         total_read += n;
-                        
+
                         if let Some(expected) = expected_length {
                             if total_read >= expected || total_read >= HTTP_BUFFER_SIZE {
                                 break;
@@ -116,7 +107,9 @@ async fn web_task(
                             .position(|w| w == b"\r\n\r\n")
                         {
                             let mut content_len = 0;
-                            if let Ok(headers_str) = core::str::from_utf8(&http_buffer[..header_end]) {
+                            if let Ok(headers_str) =
+                                core::str::from_utf8(&http_buffer[..header_end])
+                            {
                                 for line in headers_str.lines() {
                                     let lower_line = line.to_ascii_lowercase();
                                     if lower_line.starts_with("content-length:") {
@@ -130,7 +123,7 @@ async fn web_task(
                             }
                             let expected = header_end + 4 + content_len;
                             expected_length = Some(expected);
-                            
+
                             if total_read >= expected || total_read >= HTTP_BUFFER_SIZE {
                                 break;
                             }
@@ -158,7 +151,10 @@ async fn web_task(
                             i += n;
                         }
                         Err(e) => {
-                            esp_println::println!("Http wifimanager write error: {e:?}");
+                            defmt::info!(
+                                "Http wifimanager write error: {}",
+                                defmt::Debug2Format(&e)
+                            );
                             break;
                         }
                     }

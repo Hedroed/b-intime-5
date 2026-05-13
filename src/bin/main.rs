@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+extern crate esp_println as _; // Ensure defmt global logger is linked
+
 use b_intime_5::display::{Canvas, Screen};
 use b_intime_5::{mk_static, wifimanager};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -72,7 +74,7 @@ async fn main(spawner: Spawner) {
 
     let peripherals = esp_hal::init(esp_hal::Config::default());
 
-    esp_println::println!("Init!");
+    defmt::info!("Init!");
 
     let sw_int =
         esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
@@ -98,7 +100,7 @@ async fn main(spawner: Spawner) {
     .await
     .expect("wm init");
 
-    esp_println::println!("wifi_res: {wifi_res:?}");
+    defmt::info!("wifi_res: {}", defmt::Debug2Format(&wifi_res));
 
     let stack = wifi_res.sta_stack;
 
@@ -122,7 +124,11 @@ async fn main(spawner: Spawner) {
 
     let buf = [0x20_u8; 20];
     let canvas = Canvas::<32, 16>::init();
-    let mut view = View { buf, canvas, spi: &mut spi };
+    let mut view = View {
+        buf,
+        canvas,
+        spi: &mut spi,
+    };
 
     // let mut a = Animation::default();
     // view.wifi_loading(&mut a).await;
@@ -139,9 +145,7 @@ async fn main(spawner: Spawner) {
         .spawn(ha_temperature_loop(stack, temperature))
         .expect("temp loop");
 
-    spawner
-        .spawn(ntp_loop(stack, mutex_rtx))
-        .expect("ntp loop");
+    spawner.spawn(ntp_loop(stack, mutex_rtx)).expect("ntp loop");
 
     loop {
         view.view(mutex_rtx, temperature, light).await;
@@ -167,7 +171,11 @@ impl From<u16> for LigthLevel {
 }
 
 #[embassy_executor::task]
-async fn lum_loop(analog_pin: peripherals::GPIO2<'static>, adc1: peripherals::ADC1<'static>, light: &'static SharedLightlevel) {
+async fn lum_loop(
+    analog_pin: peripherals::GPIO2<'static>,
+    adc1: peripherals::ADC1<'static>,
+    light: &'static SharedLightlevel,
+) {
     let mut adc1_config = AdcConfig::new();
     let mut pin = adc1_config.enable_pin(analog_pin, Attenuation::_11dB);
     let mut adc1 = Adc::new(adc1, adc1_config).into_async();
@@ -178,7 +186,7 @@ async fn lum_loop(analog_pin: peripherals::GPIO2<'static>, adc1: peripherals::AD
         let pin_value = adc1.read_oneshot(&mut pin).await;
 
         if previous != pin_value {
-            // esp_println::println!("new lum {:?}", pin_value);
+            // defmt::info!("new lum {:?}", pin_value);
 
             let mut l = light.lock().await;
             *l = pin_value;
@@ -199,10 +207,7 @@ struct BufWriter<'a> {
 impl<'a> BufWriter<'a> {
     fn new(buf: &'a mut [u8]) -> Self {
         buf.fill(0u8);
-        BufWriter {
-            buf,
-            offset: 0,
-        }
+        BufWriter { buf, offset: 0 }
     }
 
     fn len(&self) -> usize {
@@ -246,7 +251,7 @@ struct View<'a> {
 #[allow(dead_code)]
 #[derive(Default)]
 struct Animation<const T: u32> {
-    acc: u32
+    acc: u32,
 }
 
 impl<const T: u32> Animation<T> {
@@ -273,8 +278,12 @@ fn write_buffered<'a>(buf: &'a mut [u8], format: fmt::Arguments) -> &'a str {
 }
 
 impl<'a> View<'a> {
-    async fn view(&mut self, rtc: &SharedRtc, temperature: &SharedTemperature, light: &SharedLightlevel) {
-
+    async fn view(
+        &mut self,
+        rtc: &SharedRtc,
+        temperature: &SharedTemperature,
+        light: &SharedLightlevel,
+    ) {
         let time = {
             let rtc_lock = rtc.lock().await;
             match jiff::Timestamp::from_microsecond(rtc_lock.current_time_us() as i64) {
@@ -307,7 +316,11 @@ impl<'a> View<'a> {
             self.canvas.set_pixel(31, 9, true);
         }
 
-        let text = write_buffered(&mut self.buf, format_args!("{}", time.strftime("%H:%M")));
+        let dt = time.datetime();
+        let text = write_buffered(
+            &mut self.buf,
+            format_args!("{:02}:{:02}", dt.hour(), dt.minute()),
+        );
         let light_range: LigthLevel = (*light_level).into();
         match light_range {
             LigthLevel::Bright => {
@@ -333,7 +346,7 @@ impl<'a> View<'a> {
 
         Screen::<8>::draw(self.spi, &self.canvas);
 
-        esp_println::println!("UPDATE");
+        defmt::info!("UPDATE");
     }
 
     #[allow(dead_code)]
@@ -347,13 +360,12 @@ impl<'a> View<'a> {
 
         Screen::<8>::draw(self.spi, &self.canvas);
 
-        esp_println::println!("wifi_loading {}", setp);
+        defmt::info!("wifi_loading {}", setp);
     }
 }
 
 #[embassy_executor::task]
 async fn ntp_loop(stack: Stack<'static>, rtc: &'static SharedRtc) -> ! {
-
     let mut rx_meta = [PacketMetadata::EMPTY; 16];
     let mut rx_buffer = [0; 4096];
     let mut tx_meta = [PacketMetadata::EMPTY; 16];
@@ -368,24 +380,30 @@ async fn ntp_loop(stack: Stack<'static>, rtc: &'static SharedRtc) -> ! {
     );
 
     if let Err(e) = socket.bind(123) {
-        esp_println::println!("NTP bind error: {e:?}");
+        defmt::info!("NTP bind error: {}", defmt::Debug2Format(&e));
     }
 
-    loop {
-        let ntp_addrs = match stack.dns_query(NTP_SERVER, DnsQueryType::A).await {
-            Ok(addrs) if !addrs.is_empty() => addrs,
+    let addr: IpAddr = loop {
+        stack.wait_config_up().await;
+
+        match stack.dns_query(NTP_SERVER, DnsQueryType::A).await {
+            Ok(addrs) if !addrs.is_empty() => {
+                defmt::info!("Resolved NTP DNS: {:?}", addrs);
+                break addrs[0].into();
+            }
             Err(err) => {
-                esp_println::println!("Failed to resolve NTP DNS {:?}. Retrying...", err);
-                Timer::after(Duration::from_secs(119)).await;
-                continue;
+                defmt::info!("Failed to resolve NTP DNS {:?}. Retrying...", err);
+                Timer::after(Duration::from_secs(5)).await;
             }
             _ => {
-                esp_println::println!("Failed to resolve NTP DNS. Retrying...");
-                Timer::after(Duration::from_secs(119)).await;
-                continue;
+                defmt::info!("Failed to resolve NTP DNS. Retrying...");
+                Timer::after(Duration::from_secs(5)).await;
             }
-        };
-        let addr: IpAddr = ntp_addrs[0].into();
+        }
+    };
+
+    loop {
+        stack.wait_config_up().await;
 
         let result = {
             let rtc_lock = rtc.lock().await;
@@ -411,7 +429,7 @@ async fn ntp_loop(stack: Stack<'static>, rtc: &'static SharedRtc) -> ! {
                 );
             }
             Err(e) => {
-                esp_println::println!("Error getting time: {e:?}");
+                defmt::info!("Error getting time: {}", defmt::Debug2Format(&e));
             }
         }
         Timer::after(Duration::from_secs(119)).await;
@@ -450,8 +468,10 @@ async fn ha_temperature_loop(stack: Stack<'static>, temperature: &'static Shared
 
     let mut client = HttpClient::new(&tcp, &dns);
     let mut buffer = [0u8; 4096];
-    
+
     loop {
+        stack.wait_config_up().await;
+
         let http_req_res = client
             .request(
                 reqwless::request::Method::GET,
@@ -462,50 +482,46 @@ async fn ha_temperature_loop(stack: Stack<'static>, temperature: &'static Shared
         let mut http_req = match http_req_res {
             Ok(req) => req.headers(&headers),
             Err(err) => {
-                esp_println::println!("HA request init error: {:?}", err);
+                defmt::info!("HA request init error: {:?}", defmt::Debug2Format(&err));
                 Timer::after(Duration::from_secs(10 * 60)).await;
                 continue;
             }
         };
-        
+
         let response = match http_req.send(&mut buffer).await {
-            Ok(response) => {
-                response
-            },
+            Ok(response) => response,
             Err(err) => {
-                esp_println::println!("HA error 1: {:?}", err);
+                defmt::info!("HA error 1: {:?}", defmt::Debug2Format(&err));
                 continue;
-            },
+            }
         };
 
-        esp_println::println!("Got response");
+        defmt::info!("Got response");
         let res = match response.body().read_to_end().await {
             Ok(res) => res,
             Err(err) => {
-                esp_println::println!("HA error 2: {:?}", err);
+                defmt::info!("HA error 2: {:?}", defmt::Debug2Format(&err));
                 continue;
-            },
+            }
         };
 
         match serde_json_core::from_slice::<HAResponse<'_>>(res) {
             Ok((data, _remainder)) => {
-                esp_println::println!("Temp: {}", data.attributes.temperature);
+                defmt::info!("Temp: {}", data.attributes.temperature);
 
                 {
                     let mut t = temperature.lock().await;
                     *t = Some(data.attributes.temperature);
                 }
-
-            },
+            }
             Err(err) => {
-                esp_println::println!("HA error 3: {}", err);
+                defmt::info!("HA error 3: {}", defmt::Debug2Format(&err));
                 {
                     let mut t = temperature.lock().await;
                     *t = None;
                 }
-            },
+            }
         }
-
 
         Timer::after(Duration::from_secs(10 * 60)).await;
     }

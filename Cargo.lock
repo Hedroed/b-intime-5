@@ -24,6 +24,7 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 name = "b-intime-5"
 version = "0.1.0"
 dependencies = [
+ "defmt 1.0.1",
  "embassy-executor",
  "embassy-futures",
  "embassy-net",

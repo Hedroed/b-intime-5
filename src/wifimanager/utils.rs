@@ -6,7 +6,7 @@ use esp_radio::wifi::{WifiController, WifiDevice};
 
 use embassy_net::{Config, Ipv4Cidr, StackResources, StaticConfigV4};
 
-use crate::wifimanager::structs::{ WmInnerSignals};
+use crate::wifimanager::structs::WmInnerSignals;
 
 pub async fn spawn_ap(
     rng: &mut esp_hal::rng::Rng,
@@ -32,7 +32,10 @@ pub async fn spawn_ap(
         rng.random() as u64,
     );
 
-    spawner.spawn(crate::wifimanager::ap::ap_task(ap_runner, wm_signals.clone()))?;
+    spawner.spawn(crate::wifimanager::ap::ap_task(
+        ap_runner,
+        wm_signals.clone(),
+    ))?;
     spawner.spawn(crate::wifimanager::ap::run_dhcp_server(ap_stack))?;
     crate::wifimanager::http::run_http_server(spawner, ap_stack, wm_signals.clone()).await;
 
@@ -47,7 +50,7 @@ pub async fn try_to_wifi_connect(
 
     loop {
         if start_time.elapsed().as_millis() > wifi_conn_timeout {
-            esp_println::println!("Connect timeout (1)!");
+            defmt::info!("Connect timeout (1)!");
             return false;
         }
 
@@ -59,15 +62,15 @@ pub async fn try_to_wifi_connect(
         {
             Ok(res) => match res {
                 Ok(_) => {
-                    esp_println::println!("Wifi connected!");
+                    defmt::info!("Wifi connected!");
                     return true;
                 }
                 Err(e) => {
-                    esp_println::println!("Failed to connect to wifi: {e:?}");
+                    defmt::info!("Failed to connect to wifi: {}", defmt::Debug2Format(&e));
                 }
             },
             Err(_) => {
-                esp_println::println!("Connect timeout (0)!");
+                defmt::info!("Connect timeout (0)!");
                 return false;
             }
         }
@@ -79,11 +82,11 @@ pub async fn wifi_wait_for_ip(stack: &Stack<'static>) -> [u8; 4] {
         Timer::after(Duration::from_millis(50)).await;
     }
 
-    esp_println::println!("Waiting to get IP address...");
+    defmt::info!("Waiting to get IP address...");
     let mut ip = [0; 4];
     loop {
         if let Some(config) = stack.config_v4() {
-            esp_println::println!("Got IP: {}", config.address);
+            defmt::info!("Got IP: {}", defmt::Debug2Format(&config.address));
             ip.copy_from_slice(&config.address.address().octets());
             break;
         }

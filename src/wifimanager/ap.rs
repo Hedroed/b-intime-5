@@ -27,7 +27,7 @@ pub async fn run_dhcp_server(ap_stack: Stack<'static>) {
     .await;
 
     if let Err(e) = res {
-        esp_println::println!("run_dhcp_server failed! ({e:?})");
+        defmt::info!("run_dhcp_server failed! ({})", defmt::Debug2Format(&e));
     }
 }
 

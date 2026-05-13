@@ -15,27 +15,30 @@ impl Nvs {
         flash: esp_hal::peripherals::FLASH<'static>,
         flash_size: usize,
     ) -> super::structs::Result<Self> {
-
         let flash = crate::mk_static!(FlashStorage<'static>, FlashStorage::new(flash)); // peripherals.FLASH
-        esp_println::println!("Flash size = {}", flash.capacity());
+        defmt::info!("Flash size = {}", flash.capacity());
 
-        let pt_mem = crate::mk_static!([u8; partitions::PARTITION_TABLE_MAX_LEN], [0u8; partitions::PARTITION_TABLE_MAX_LEN]);
-        let pt = partitions::read_partition_table(flash, pt_mem).map_err(|_| super::structs::WmError::NvsError)?;
+        let pt_mem = crate::mk_static!(
+            [u8; partitions::PARTITION_TABLE_MAX_LEN],
+            [0u8; partitions::PARTITION_TABLE_MAX_LEN]
+        );
+        let pt = partitions::read_partition_table(flash, pt_mem)
+            .map_err(|_| super::structs::WmError::NvsError)?;
 
         for i in 0..pt.len() {
             if let Ok(raw) = pt.get_partition(i) {
-                esp_println::println!("{:?}", raw);
+                defmt::info!("{}", defmt::Debug2Format(&raw));
             }
         }
 
         let nvs = pt
-        .find_partition(partitions::PartitionType::Data(
-            partitions::DataPartitionSubType::Nvs,
-        ))?
-        .ok_or(super::structs::WmError::NvsError)?;
+            .find_partition(partitions::PartitionType::Data(
+                partitions::DataPartitionSubType::Nvs,
+            ))?
+            .ok_or(super::structs::WmError::NvsError)?;
 
         let nvs_partition = nvs.as_embedded_storage(flash);
-        esp_println::println!("NVS partition size = {}", nvs_partition.capacity());
+        defmt::info!("NVS partition size = {}", nvs_partition.capacity());
 
         Ok(Nvs {
             offset: 0,
@@ -45,26 +48,15 @@ impl Nvs {
     }
 
     pub fn write(&mut self, buf: &[u8]) -> super::structs::Result<()> {
-        self.region
-            .write(self.offset, &buf[..self.size])?;
+        self.region.write(self.offset, &buf[..self.size])?;
         Ok(())
     }
 
     pub fn read(&mut self, buf: &mut [u8]) -> super::structs::Result<()> {
-
-        self.region
-            .read(self.offset, buf)?;
-
-        esp_println::println!(
-            "Read from {:x}:  {:02x?}",
-            self.offset,
-            &buf[..self.size]
-        );
+        self.region.read(self.offset, buf)?;
         Ok(())
     }
-
 }
-
 
 pub struct SavedSettings {
     nvs: Nvs,
@@ -72,9 +64,7 @@ pub struct SavedSettings {
 }
 
 impl SavedSettings {
-    pub fn new(
-        flash: esp_hal::peripherals::FLASH<'static>,
-    ) -> super::structs::Result<Self> {
+    pub fn new(flash: esp_hal::peripherals::FLASH<'static>) -> super::structs::Result<Self> {
         Ok(Self {
             nvs: Nvs::new(flash, 1024)?,
             buf: [0u8; 1024],
@@ -84,14 +74,15 @@ impl SavedSettings {
     pub fn load(&mut self) -> super::structs::Result<Option<AutoSetupSettings>> {
         let _ = self.nvs.read(&mut self.buf);
 
-        let end_pos = self.buf
-                .iter()
-                .position(|&x| x == 0x00)
-                .unwrap_or(self.buf.len());
+        let end_pos = self
+            .buf
+            .iter()
+            .position(|&x| x == 0x00)
+            .unwrap_or(self.buf.len());
 
-        if let Ok((data, _)) = serde_json_core::from_slice::<AutoSetupSettings>(
-            &self.buf[..end_pos],
-        ) {
+        if let Ok((data, _)) =
+            serde_json_core::from_slice::<AutoSetupSettings>(&self.buf[..end_pos])
+        {
             Ok(Some(data))
         } else {
             Ok(None)
@@ -101,11 +92,8 @@ impl SavedSettings {
     pub fn save(&mut self, settings: &AutoSetupSettings) -> super::structs::Result<()> {
         self.buf.fill(0u8);
 
-        serde_json_core::to_slice(
-            settings,
-            &mut self.buf,
-        )?;
-        esp_println::println!("write to nvs: {:?}", self.buf);
+        serde_json_core::to_slice(settings, &mut self.buf)?;
+        defmt::info!("write to nvs: {=[u8]}", self.buf);
 
         self.nvs.write(&self.buf)?;
 
