@@ -25,11 +25,11 @@ impl Nvs {
         let pt = partitions::read_partition_table(flash, pt_mem)
             .map_err(|_| super::structs::WmError::NvsError)?;
 
-        for i in 0..pt.len() {
-            if let Ok(raw) = pt.get_partition(i) {
-                defmt::info!("{}", defmt::Debug2Format(&raw));
-            }
-        }
+        // for i in 0..pt.len() {
+        //     if let Ok(raw) = pt.get_partition(i) {
+        //         defmt::info!("{}", defmt::Debug2Format(&raw));
+        //     }
+        // }
 
         let nvs = pt
             .find_partition(partitions::PartitionType::Data(

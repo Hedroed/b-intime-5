@@ -7,6 +7,7 @@ use b_intime_5::display::{Canvas, Screen};
 use b_intime_5::{mk_static, wifimanager};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
+use reqwless::response::Status;
 use reqwless::{client::HttpClient, request::RequestBuilder};
 use serde::Deserialize;
 
@@ -28,7 +29,6 @@ use esp_hal::{
     analog::adc::{Adc, AdcConfig, Attenuation},
     gpio::{Level, Output, OutputConfig},
     peripherals,
-    rtc_cntl::Rtc,
     spi::{self, master::Spi},
     time::Rate,
     timer::timg::TimerGroup,
@@ -36,25 +36,30 @@ use esp_hal::{
 };
 use sntpc::{get_time, NtpContext, NtpTimestampGenerator};
 
-type SharedRtc = Mutex<CriticalSectionRawMutex, Rtc<'static>>;
+#[derive(Clone, Copy)]
+struct TimeOffset {
+    ntp_base_us: u64,
+    local_base_us: u64,
+}
+
+type SharedTime = Mutex<CriticalSectionRawMutex, Option<TimeOffset>>;
 type SharedTemperature = Mutex<CriticalSectionRawMutex, Option<f32>>;
 type SharedLightlevel = Mutex<CriticalSectionRawMutex, u16>;
 
 const TIMEZONE: jiff::tz::TimeZone = jiff::tz::get!("Europe/Paris");
-const NTP_SERVER: &str = "pool.ntp.org";
+const NTP_SERVER: &str = "time.google.com";
 
 /// Microseconds in a second
 const USEC_IN_SEC: u64 = 1_000_000;
 
 #[derive(Clone, Copy)]
-struct Timestamp<'a> {
-    rtc: &'a Rtc<'a>,
+struct Timestamp {
     current_time_us: u64,
 }
 
-impl NtpTimestampGenerator for Timestamp<'_> {
+impl NtpTimestampGenerator for Timestamp {
     fn init(&mut self) {
-        self.current_time_us = self.rtc.current_time_us();
+        self.current_time_us = embassy_time::Instant::now().as_micros();
     }
 
     fn timestamp_sec(&self) -> u64 {
@@ -118,8 +123,6 @@ async fn main(spawner: Spawner) {
     .with_mosi(mosi)
     .with_cs(cs);
 
-    let rtc = Rtc::new(peripherals.LPWR);
-
     Screen::<8>::init(&mut spi);
 
     let buf = [0x20_u8; 20];
@@ -133,7 +136,7 @@ async fn main(spawner: Spawner) {
     // let mut a = Animation::default();
     // view.wifi_loading(&mut a).await;
 
-    let mutex_rtx = mk_static!(SharedRtc, Mutex::new(rtc));
+    let mutex_time = mk_static!(SharedTime, Mutex::new(None));
     let temperature = mk_static!(SharedTemperature, Mutex::new(None));
     let light = mk_static!(SharedLightlevel, Mutex::new(0));
 
@@ -145,10 +148,12 @@ async fn main(spawner: Spawner) {
         .spawn(ha_temperature_loop(stack, temperature))
         .expect("temp loop");
 
-    spawner.spawn(ntp_loop(stack, mutex_rtx)).expect("ntp loop");
+    spawner
+        .spawn(ntp_loop(stack, mutex_time))
+        .expect("ntp loop");
 
     loop {
-        view.view(mutex_rtx, temperature, light).await;
+        view.view(mutex_time, temperature, light).await;
         Timer::after(Duration::from_secs(17)).await;
     }
 }
@@ -280,15 +285,21 @@ fn write_buffered<'a>(buf: &'a mut [u8], format: fmt::Arguments) -> &'a str {
 impl<'a> View<'a> {
     async fn view(
         &mut self,
-        rtc: &SharedRtc,
+        time_offset: &SharedTime,
         temperature: &SharedTemperature,
         light: &SharedLightlevel,
     ) {
         let time = {
-            let rtc_lock = rtc.lock().await;
-            match jiff::Timestamp::from_microsecond(rtc_lock.current_time_us() as i64) {
-                Ok(t) => t.to_zoned(TIMEZONE),
-                Err(_) => jiff::Timestamp::from_second(0).unwrap().to_zoned(TIMEZONE),
+            let offset_lock = time_offset.lock().await;
+            if let Some(offset) = *offset_lock {
+                let now = embassy_time::Instant::now().as_micros();
+                let current_us = offset.ntp_base_us + now.saturating_sub(offset.local_base_us);
+                match jiff::Timestamp::from_microsecond(current_us as i64) {
+                    Ok(t) => t.to_zoned(TIMEZONE),
+                    Err(_) => jiff::Timestamp::from_second(0).unwrap().to_zoned(TIMEZONE),
+                }
+            } else {
+                jiff::Timestamp::from_second(0).unwrap().to_zoned(TIMEZONE)
             }
         };
 
@@ -340,8 +351,16 @@ impl<'a> View<'a> {
             "N/A&"
         };
 
-        if light_range == LigthLevel::Bright {
-            self.canvas.print_5x7(2, 9, text);
+        match light_range {
+            LigthLevel::Bright => {
+                self.canvas.print_5x7(2, 9, text);
+            }
+            LigthLevel::Low => {
+                // self.canvas.print_4x4(6, 10, text);
+            }
+            LigthLevel::Dark => {
+                // self.canvas.print_4x4(6, 8, text);
+            }
         }
 
         Screen::<8>::draw(self.spi, &self.canvas);
@@ -365,80 +384,88 @@ impl<'a> View<'a> {
 }
 
 #[embassy_executor::task]
-async fn ntp_loop(stack: Stack<'static>, rtc: &'static SharedRtc) -> ! {
-    let mut rx_meta = [PacketMetadata::EMPTY; 16];
-    let mut rx_buffer = [0; 4096];
-    let mut tx_meta = [PacketMetadata::EMPTY; 16];
-    let mut tx_buffer = [0; 4096];
-
-    let mut socket = UdpSocket::new(
-        stack,
-        &mut rx_meta,
-        &mut rx_buffer,
-        &mut tx_meta,
-        &mut tx_buffer,
-    );
-
-    if let Err(e) = socket.bind(123) {
-        defmt::info!("NTP bind error: {}", defmt::Debug2Format(&e));
-    }
-
-    let addr: IpAddr = loop {
-        stack.wait_config_up().await;
-
-        match stack.dns_query(NTP_SERVER, DnsQueryType::A).await {
-            Ok(addrs) if !addrs.is_empty() => {
-                defmt::info!("Resolved NTP DNS: {:?}", addrs);
-                break addrs[0].into();
-            }
-            Err(err) => {
-                defmt::info!("Failed to resolve NTP DNS {:?}. Retrying...", err);
-                Timer::after(Duration::from_secs(5)).await;
-            }
-            _ => {
-                defmt::info!("Failed to resolve NTP DNS. Retrying...");
-                Timer::after(Duration::from_secs(5)).await;
-            }
-        }
-    };
+async fn ntp_loop(stack: Stack<'static>, time_offset: &'static SharedTime) -> ! {
+    let mut port = 50_000;
 
     loop {
         stack.wait_config_up().await;
 
-        let result = {
-            let rtc_lock = rtc.lock().await;
+        let addr: IpAddr = match stack.dns_query(NTP_SERVER, DnsQueryType::A).await {
+            Ok(addrs) if !addrs.is_empty() => {
+                defmt::info!("Resolved NTP DNS: {:?}", addrs);
+                addrs[0].into()
+            }
+            Err(err) => {
+                defmt::info!("Failed to resolve NTP DNS {:?}. Using fallback IP...", err);
+                IpAddr::V4(core::net::Ipv4Addr::new(216, 239, 35, 12))
+            }
+            _ => {
+                defmt::info!("Failed to resolve NTP DNS. Using fallback IP...");
+                IpAddr::V4(core::net::Ipv4Addr::new(216, 239, 35, 12))
+            }
+        };
+
+        // Fresh socket per request — avoids stale responses causing IncorrectOriginTimestamp.
+        // NTP packets are 48 bytes, so minimal buffers suffice.
+        let mut rx_meta = [PacketMetadata::EMPTY; 2];
+        let mut rx_buffer = [0; 128];
+        let mut tx_meta = [PacketMetadata::EMPTY; 2];
+        let mut tx_buffer = [0; 128];
+
+        let mut socket = UdpSocket::new(
+            stack,
+            &mut rx_meta,
+            &mut rx_buffer,
+            &mut tx_meta,
+            &mut tx_buffer,
+        );
+
+        if let Err(e) = socket.bind(port) {
+            defmt::info!("NTP bind error: {}", e);
+        }
+        port += 1;
+        if port > 60_000 {
+            port = 50_000;
+        }
+
+        let result = embassy_time::with_timeout(
+            Duration::from_secs(10),
             get_time(
                 SocketAddr::from((addr, 123)),
                 &socket,
-                NtpContext::new(Timestamp {
-                    rtc: &rtc_lock,
-                    current_time_us: 0,
-                }),
-            )
-            .await
-        };
+                NtpContext::new(Timestamp { current_time_us: 0 }),
+            ),
+        )
+        .await;
 
         match result {
-            Ok(time) => {
-                let rtc_lock = rtc.lock().await;
+            Ok(Ok(time)) => {
+                defmt::info!("NTP time received: sec={}", time.sec());
+                {
+                    let mut lock = time_offset.lock().await;
+                    *lock = Some(TimeOffset {
+                        ntp_base_us: (time.sec() as u64 * USEC_IN_SEC)
+                            + ((time.sec_fraction() as u64 * USEC_IN_SEC) >> 32),
+                        local_base_us: embassy_time::Instant::now().as_micros(),
+                    });
+                }
 
-                // Set time immediately after receiving to reduce time offset.
-                rtc_lock.set_current_time_us(
-                    (time.sec() as u64 * USEC_IN_SEC)
-                        + ((time.sec_fraction() as u64 * USEC_IN_SEC) >> 32),
-                );
+                Timer::after(Duration::from_secs(30 * 60)).await;
             }
-            Err(e) => {
-                defmt::info!("Error getting time: {}", defmt::Debug2Format(&e));
+            Ok(Err(e)) => {
+                defmt::info!("Error getting time: {}", e);
+                Timer::after(Duration::from_secs(10)).await;
+            }
+            Err(_) => {
+                defmt::info!("Timeout getting time");
+                Timer::after(Duration::from_secs(10)).await;
             }
         }
-        Timer::after(Duration::from_secs(119)).await;
     }
 }
 
 #[derive(Deserialize, Clone)]
 struct HAResponse<'a> {
-    #[allow(dead_code)]
     state: &'a str,
     attributes: HAAttributes,
 }
@@ -446,9 +473,7 @@ struct HAResponse<'a> {
 #[derive(Deserialize, Clone)]
 struct HAAttributes {
     temperature: f32,
-    #[allow(dead_code)]
     humidity: usize,
-    #[allow(dead_code)]
     wind_speed: f32,
 }
 
@@ -469,6 +494,7 @@ async fn ha_temperature_loop(stack: Stack<'static>, temperature: &'static Shared
     let mut client = HttpClient::new(&tcp, &dns);
     let mut buffer = [0u8; 4096];
 
+    defmt::info!("HA init");
     loop {
         stack.wait_config_up().await;
 
@@ -482,25 +508,50 @@ async fn ha_temperature_loop(stack: Stack<'static>, temperature: &'static Shared
         let mut http_req = match http_req_res {
             Ok(req) => req.headers(&headers),
             Err(err) => {
-                defmt::info!("HA request init error: {:?}", defmt::Debug2Format(&err));
+                defmt::error!("HA request init error: {}", err);
                 Timer::after(Duration::from_secs(10 * 60)).await;
                 continue;
             }
         };
 
-        let response = match http_req.send(&mut buffer).await {
-            Ok(response) => response,
-            Err(err) => {
-                defmt::info!("HA error 1: {:?}", defmt::Debug2Format(&err));
+        let response =
+            match embassy_time::with_timeout(Duration::from_secs(10), http_req.send(&mut buffer))
+                .await
+            {
+                Ok(Ok(response)) => response,
+                Ok(Err(err)) => {
+                    defmt::error!("HA error 1: {}", err);
+                    Timer::after(Duration::from_secs(10)).await;
+                    continue;
+                }
+                Err(_) => {
+                    defmt::error!("HA request send timeout");
+                    Timer::after(Duration::from_secs(10)).await;
+                    continue;
+                }
+            };
+
+        if response.status != Status::Ok {
+            defmt::error!("HA bad status code: {}", response.status);
+            Timer::after(Duration::from_secs(10)).await;
+            continue;
+        }
+
+        let res = match embassy_time::with_timeout(
+            Duration::from_secs(10),
+            response.body().read_to_end(),
+        )
+        .await
+        {
+            Ok(Ok(res)) => res,
+            Ok(Err(err)) => {
+                defmt::error!("HA error 2: {}", err);
+                Timer::after(Duration::from_secs(10)).await;
                 continue;
             }
-        };
-
-        defmt::info!("Got response");
-        let res = match response.body().read_to_end().await {
-            Ok(res) => res,
-            Err(err) => {
-                defmt::info!("HA error 2: {:?}", defmt::Debug2Format(&err));
+            Err(_) => {
+                defmt::error!("HA response read timeout");
+                Timer::after(Duration::from_secs(10)).await;
                 continue;
             }
         };
@@ -515,7 +566,7 @@ async fn ha_temperature_loop(stack: Stack<'static>, temperature: &'static Shared
                 }
             }
             Err(err) => {
-                defmt::info!("HA error 3: {}", defmt::Debug2Format(&err));
+                defmt::error!("HA error 3: {}", err);
                 {
                     let mut t = temperature.lock().await;
                     *t = None;

@@ -182,7 +182,7 @@ async fn connection(
     stop_signal: Rc<Signal<CriticalSectionRawMutex, bool>>,
     //stack: &'static Stack<WifiDevice<'static, WifiStaDevice>>,
 ) {
-    defmt::info!(
+    defmt::debug!(
         "WIFI Device capabilities: {}",
         defmt::Debug2Format(&controller.capabilities())
     );
